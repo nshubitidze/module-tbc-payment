@@ -9,7 +9,7 @@
                 <model>ShuboTbcPaymentFacade</model>
                 <order_status>pending</order_status>
                 <payment_action>authorize_capture</payment_action>
-                <currency>GEL</currency>
+
                 <can_authorize>0</can_authorize>
                 <can_capture>0</can_capture>
                 <can_refund>1</can_refund>

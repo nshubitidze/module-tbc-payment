@@ -16,7 +16,7 @@ class Config extends \Magento\Payment\Gateway\Config\Config
     private const KEY_TITLE = 'title';
     private const KEY_MERCHANT_ID = 'merchant_id';
     private const KEY_PASSWORD = 'password';
-    private const KEY_CURRENCY = 'currency';
+
     private const KEY_SANDBOX_MODE = 'sandbox_mode';
     private const KEY_API_URL = 'api_url';
     private const KEY_SANDBOX_API_URL = 'sandbox_api_url';
@@ -51,11 +51,6 @@ class Config extends \Magento\Payment\Gateway\Config\Config
     {
         $value = (string) $this->getValue(self::KEY_PASSWORD, $storeId);
         return $this->encryptor->decrypt($value);
-    }
-
-    public function getCurrency(?int $storeId = null): string
-    {
-        return (string) ($this->getValue(self::KEY_CURRENCY, $storeId) ?: 'GEL');
     }
 
     public function isSandboxMode(?int $storeId = null): bool

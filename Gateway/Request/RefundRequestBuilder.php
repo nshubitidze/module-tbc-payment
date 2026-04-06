@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Shubo\TbcPayment\Gateway\Request;
 
 use Magento\Payment\Gateway\Request\BuilderInterface;
+use Magento\Store\Model\StoreManagerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Helper\SubjectReader;
 
@@ -16,6 +17,7 @@ class RefundRequestBuilder implements BuilderInterface
     public function __construct(
         private readonly Config $config,
         private readonly SubjectReader $subjectReader,
+        private readonly StoreManagerInterface $storeManager,
     ) {
     }
 
@@ -33,7 +35,7 @@ class RefundRequestBuilder implements BuilderInterface
         $orderId = $order->getOrderIncrementId();
         $merchantId = $this->config->getMerchantId($storeId);
         $password = $this->config->getPassword($storeId);
-        $currency = $this->config->getCurrency($storeId);
+        $currency = $this->storeManager->getStore($storeId)->getCurrentCurrencyCode();
 
         $params = [
             'order_id' => $orderId,

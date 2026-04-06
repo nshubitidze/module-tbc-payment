@@ -94,12 +94,14 @@ define([
             // Load SDK and initialize
             require(['flittCheckout'], function (checkout) {
                 try {
+                    var locale = config && config.locale ? config.locale : 'en';
+
                     checkout(containerId, {
                         params: {
                             token: token
                         },
                         options: {
-                            locales: ['en', 'ka'],
+                            locales: [locale],
                             active_tab: 'card',
                             logo_url: '',
                             full_screen: false

@@ -6,6 +6,7 @@ namespace Shubo\TbcPayment\Gateway\Request;
 
 use Magento\Framework\UrlInterface;
 use Magento\Payment\Gateway\Request\BuilderInterface;
+use Magento\Store\Model\StoreManagerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Helper\SubjectReader;
 
@@ -18,6 +19,7 @@ class InitializeRequestBuilder implements BuilderInterface
         private readonly Config $config,
         private readonly SubjectReader $subjectReader,
         private readonly UrlInterface $urlBuilder,
+        private readonly StoreManagerInterface $storeManager,
     ) {
     }
 
@@ -35,7 +37,7 @@ class InitializeRequestBuilder implements BuilderInterface
         $orderId = $order->getOrderIncrementId();
         $merchantId = $this->config->getMerchantId($storeId);
         $password = $this->config->getPassword($storeId);
-        $currency = $this->config->getCurrency($storeId);
+        $currency = $this->storeManager->getStore($storeId)->getCurrentCurrencyCode();
 
         $params = [
             'order_id' => $orderId,

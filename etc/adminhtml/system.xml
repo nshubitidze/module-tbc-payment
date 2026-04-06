@@ -32,12 +32,6 @@
                     <backend_model>Magento\Config\Model\Config\Backend\Encrypted</backend_model>
                 </field>
 
-                <field id="currency" translate="label comment" type="text" sortOrder="50"
-                       showInDefault="1" showInWebsite="1" showInStore="0">
-                    <label>Currency</label>
-                    <comment>ISO alpha currency code (e.g., GEL).</comment>
-                </field>
-
                 <field id="sandbox_mode" translate="label" type="select" sortOrder="60"
                        showInDefault="1" showInWebsite="1" showInStore="0">
                     <label>Sandbox Mode</label>
