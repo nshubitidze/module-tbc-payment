@@ -1,0 +1,45 @@
+<div class="payment-method" data-bind="css: {'_active': (getCode() == isChecked())}">
+    <div class="payment-method-title field choice">
+        <input type="radio"
+               name="payment[method]"
+               class="radio"
+               data-bind="attr: {'id': getCode()}, value: getCode(), checked: isChecked, click: selectPaymentMethod, visible: isRadioButtonVisible()"/>
+        <label data-bind="attr: {'for': getCode()}" class="label">
+            <span data-bind="text: getTitle()"></span>
+        </label>
+    </div>
+
+    <div class="payment-method-content" data-bind="visible: isChecked() == getCode()">
+        <!-- ko if: paymentError() -->
+        <div class="message message-error" data-bind="text: paymentError()"></div>
+        <!-- /ko -->
+
+        <div id="shubo-tbc-payment-container" class="shubo-tbc-embed-container">
+            <!-- Flitt Embed SDK will render the payment form here -->
+        </div>
+
+        <!-- ko ifnot: isPaymentProcessing() -->
+        <div class="payment-method-billing-address">
+            <!-- ko foreach: $parent.getRegion('billingAddress') -->
+            <!-- ko template: getTemplate() --><!-- /ko -->
+            <!-- /ko -->
+        </div>
+
+        <div class="actions-toolbar">
+            <div class="primary">
+                <button class="action primary checkout"
+                        type="submit"
+                        data-bind="click: placeOrder, attr: {title: $t('Pay with TBC Bank')}, enable: (getCode() == isChecked())">
+                    <span data-bind="i18n: 'Pay with TBC Bank'"></span>
+                </button>
+            </div>
+        </div>
+        <!-- /ko -->
+
+        <!-- ko if: isPaymentProcessing() -->
+        <div class="shubo-tbc-processing">
+            <span data-bind="i18n: 'Processing your payment...'"></span>
+        </div>
+        <!-- /ko -->
+    </div>
+</div>
