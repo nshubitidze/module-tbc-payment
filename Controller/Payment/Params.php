@@ -65,13 +65,13 @@ class Params implements HttpPostActionInterface
             }
 
             $reservedOrderId = (string) $quote->getReservedOrderId();
-            $amount = (string) (int) round((float) $quote->getGrandTotal() * 100);
+            $amount = (int) round((float) $quote->getGrandTotal() * 100);
             $currency = (string) ($quote->getQuoteCurrencyCode() ?: 'GEL');
             $locale = $this->resolveLanguage();
 
             $params = [
                 'order_id' => $reservedOrderId,
-                'merchant_id' => (string) $merchantId,
+                'merchant_id' => (int) $merchantId,
                 'order_desc' => (string) __('Order %1', $reservedOrderId),
                 'amount' => $amount,
                 'currency' => $currency,
