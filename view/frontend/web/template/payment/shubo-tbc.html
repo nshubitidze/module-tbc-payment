@@ -11,34 +11,44 @@
 
     <div class="payment-method-content" data-bind="visible: isChecked() == getCode()">
         <!-- ko if: paymentError() -->
-        <div class="message message-error" data-bind="text: paymentError()"></div>
+        <div class="message message-error error" data-bind="text: paymentError()"></div>
         <!-- /ko -->
 
-        <div id="shubo-tbc-payment-container" class="shubo-tbc-embed-container">
-            <!-- Flitt Embed SDK will render the payment form here -->
-        </div>
+        <!-- Flitt card form renders here -->
+        <div id="shubo-tbc-embed-container" style="min-height: 100px;"></div>
 
-        <!-- ko ifnot: isPaymentProcessing() -->
+        <!-- Loading indicator -->
+        <!-- ko if: !isEmbedLoaded() && !paymentError() -->
+        <div style="text-align:center; padding:20px; color:#999;">
+            <span data-bind="i18n: 'Loading secure payment form...'"></span>
+        </div>
+        <!-- /ko -->
+
+        <!-- Billing address -->
+        <!-- ko if: isEmbedLoaded() -->
         <div class="payment-method-billing-address">
             <!-- ko foreach: $parent.getRegion('billingAddress') -->
             <!-- ko template: getTemplate() --><!-- /ko -->
             <!-- /ko -->
         </div>
+        <!-- /ko -->
 
+        <!-- Place Order button -->
+        <!-- ko if: isEmbedLoaded() && !isProcessing() -->
         <div class="actions-toolbar">
             <div class="primary">
-                <button class="action primary checkout"
-                        type="submit"
-                        data-bind="click: placeOrder, attr: {title: $t('Pay with TBC Bank')}, enable: (getCode() == isChecked())">
-                    <span data-bind="i18n: 'Pay with TBC Bank'"></span>
+                <button class="action primary checkout" type="submit"
+                        data-bind="click: placeOrder, attr: {title: $t('Place Order')}">
+                    <span data-bind="i18n: 'Place Order'"></span>
                 </button>
             </div>
         </div>
         <!-- /ko -->
 
-        <!-- ko if: isPaymentProcessing() -->
-        <div class="shubo-tbc-processing">
-            <span data-bind="i18n: 'Processing your payment...'"></span>
+        <!-- Processing indicator -->
+        <!-- ko if: isProcessing() -->
+        <div style="text-align:center; padding:20px;">
+            <span data-bind="i18n: 'Processing payment...'"></span>
         </div>
         <!-- /ko -->
     </div>

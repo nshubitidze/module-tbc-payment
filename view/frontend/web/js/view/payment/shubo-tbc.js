@@ -1,145 +1,184 @@
 define([
     'Magento_Checkout/js/view/payment/default',
-    'Magento_Checkout/js/model/full-screen-loader',
     'Magento_Checkout/js/action/redirect-on-success',
     'Magento_Checkout/js/model/quote',
+    'Magento_Checkout/js/model/full-screen-loader',
     'mage/url',
     'mage/translate',
     'jquery',
     'ko'
-], function (Component, fullScreenLoader, redirectOnSuccessAction, quote, urlBuilder, $t, $, ko) {
+], function (Component, redirectOnSuccessAction, quote, fullScreenLoader, urlBuilder, $t, $, ko) {
     'use strict';
 
     return Component.extend({
         defaults: {
             template: 'Shubo_TbcPayment/payment/shubo-tbc',
             redirectAfterPlaceOrder: false,
-            flittToken: null,
-            isPaymentProcessing: ko.observable(false),
-            paymentError: ko.observable('')
+            paymentService: null,
+            isEmbedLoaded: ko.observable(false),
+            paymentError: ko.observable(''),
+            isProcessing: ko.observable(false)
         },
 
         /**
          * Get payment method code.
+         *
+         * @returns {string}
          */
         getCode: function () {
             return 'shubo_tbc';
         },
 
         /**
-         * Check if payment method is active.
+         * Check if payment method is active (selected).
+         *
+         * @returns {boolean}
          */
         isActive: function () {
             return this.getCode() === this.isChecked();
         },
 
         /**
-         * Get payment method title from config.
+         * When customer selects this payment method, load the Flitt embed form.
+         *
+         * @returns {boolean}
          */
-        getTitle: function () {
-            var config = window.checkoutConfig.payment.shubo_tbc;
-            return config ? config.title : $t('TBC Bank (Card Payment)');
-        },
+        selectPaymentMethod: function () {
+            this._super();
 
-        /**
-         * After order is placed, get token and initialize Flitt Embed.
-         */
-        afterPlaceOrder: function () {
-            var self = this;
-
-            self.isPaymentProcessing(true);
-            self.paymentError('');
-            fullScreenLoader.startLoader();
-
-            $.ajax({
-                url: urlBuilder.build('shubo_tbc/payment/gettoken'),
-                type: 'GET',
-                dataType: 'json',
-                cache: false
-            }).done(function (response) {
-                fullScreenLoader.stopLoader();
-
-                if (response.success && response.token) {
-                    self.flittToken = response.token;
-                    self.initFlittEmbed(response.token);
-                } else {
-                    self.isPaymentProcessing(false);
-                    self.paymentError(
-                        response.message || $t('Unable to initialize payment. Please try again.')
-                    );
-                }
-            }).fail(function () {
-                fullScreenLoader.stopLoader();
-                self.isPaymentProcessing(false);
-                self.paymentError($t('Unable to connect to payment gateway. Please try again.'));
-            });
-        },
-
-        /**
-         * Initialize Flitt Embed SDK with the obtained token.
-         */
-        initFlittEmbed: function (token) {
-            var self = this;
-            var config = window.checkoutConfig.payment.shubo_tbc;
-            var containerId = '#shubo-tbc-payment-container';
-
-            // Load CSS dynamically
-            if (config && config.sdkCssUrl) {
-                var linkEl = document.createElement('link');
-                linkEl.rel = 'stylesheet';
-                linkEl.href = config.sdkCssUrl;
-                document.head.appendChild(linkEl);
+            if (!this.paymentService) {
+                this.initEmbed();
             }
 
-            // Load SDK and initialize
-            require(['flittCheckout'], function (checkout) {
-                try {
-                    var locale = config && config.locale ? config.locale : 'en';
+            return true;
+        },
 
-                    checkout(containerId, {
-                        params: {
-                            token: token
-                        },
-                        options: {
-                            locales: [locale],
-                            active_tab: 'card',
-                            logo_url: '',
-                            full_screen: false
-                        },
-                        callbackUrl: function () {
-                            // Payment completed - redirect to success page
-                            self.isPaymentProcessing(false);
-                            redirectOnSuccessAction.execute();
-                        },
-                        onClose: function () {
-                            self.isPaymentProcessing(false);
-                        },
-                        onError: function (error) {
-                            self.isPaymentProcessing(false);
-                            self.paymentError(
-                                $t('Payment failed. Please try again or use a different payment method.')
-                            );
-                        }
-                    });
-                } catch (e) {
-                    self.isPaymentProcessing(false);
-                    self.paymentError($t('Unable to load payment form. Please try again.'));
-                    console.error('Flitt Embed initialization error:', e);
+        /**
+         * Fetch signed payment params from backend and initialize the Flitt embed form.
+         * The backend generates a signature using the merchant secret — the secret
+         * itself is never sent to the frontend.
+         */
+        initEmbed: function () {
+            var self = this;
+
+            self.paymentError('');
+
+            $.ajax({
+                url: urlBuilder.build('shubo_tbc/payment/params'),
+                type: 'POST',
+                dataType: 'json',
+                data: {}
+            }).done(function (response) {
+                if (response.success && response.params) {
+                    self.renderFlittEmbed(response.params);
+                } else {
+                    self.paymentError(response.message || $t('Unable to load payment form.'));
                 }
-            }, function (err) {
-                self.isPaymentProcessing(false);
-                self.paymentError($t('Unable to load payment SDK. Please try again.'));
-                console.error('Flitt SDK load error:', err);
+            }).fail(function () {
+                self.paymentError($t('Unable to connect to payment service.'));
             });
         },
 
         /**
-         * Get payment method data for order placement.
+         * Render the Flitt Embed card form inside the container element.
+         *
+         * @param {Object} params - Signed payment parameters from the backend.
+         */
+        renderFlittEmbed: function (params) {
+            var self = this;
+
+            require(['flittCheckout'], function (checkout) {
+                try {
+                    self.paymentService = checkout('#shubo-tbc-embed-container', {
+                        options: {
+                            methods_disabled: ['banks', 'most_popular', 'wallets'],
+                            full_screen: false,
+                            show_pay_button: false,
+                            theme: {
+                                type: 'light',
+                                preset: 'reset'
+                            }
+                        },
+                        params: params
+                    });
+                    self.isEmbedLoaded(true);
+                } catch (e) {
+                    self.paymentError($t('Unable to render payment form.'));
+                    console.error('Flitt embed init error:', e);
+                }
+            }, function () {
+                self.paymentError($t('Unable to load payment SDK.'));
+            });
+        },
+
+        /**
+         * Override placeOrder: submit the embedded Flitt form first.
+         * Only create the Magento order AFTER payment succeeds.
+         *
+         * @param {Object} data
+         * @param {Event} event
+         * @returns {boolean}
+         */
+        placeOrder: function (data, event) {
+            var self = this;
+
+            if (!self.paymentService) {
+                self.paymentError($t('Payment form not loaded.'));
+                return false;
+            }
+
+            if (!self.validate()) {
+                return false;
+            }
+
+            if (event) {
+                event.preventDefault();
+            }
+
+            self.isProcessing(true);
+            self.paymentError('');
+
+            var payment = self.paymentService.submit();
+
+            payment.$on('success', function () {
+                self.isProcessing(false);
+                self.getPlaceOrderDeferredObject()
+                    .done(function () {
+                        self.afterPlaceOrder();
+                    })
+                    .fail(function () {
+                        self.isProcessing(false);
+                        self.paymentError($t('Order could not be placed. Please try again.'));
+                    });
+            });
+
+            payment.$on('error', function (model) {
+                self.isProcessing(false);
+                var msg = model && model.attr
+                    ? model.attr('error.message')
+                    : $t('Payment was declined.');
+                self.paymentError(msg);
+            });
+
+            return false;
+        },
+
+        /**
+         * After Magento order is placed, redirect to the success page.
+         */
+        afterPlaceOrder: function () {
+            redirectOnSuccessAction.execute();
+        },
+
+        /**
+         * Return payment data for order placement.
+         *
+         * @returns {Object}
          */
         getData: function () {
             return {
-                'method': this.getCode(),
-                'additional_data': {}
+                method: this.getCode(),
+                additional_data: {}
             };
         }
     });

@@ -94,13 +94,6 @@
         </arguments>
     </virtualType>
 
-    <!-- Inject command pool into GetToken controller -->
-    <type name="Shubo\TbcPayment\Controller\Payment\GetToken">
-        <arguments>
-            <argument name="commandPool" xsi:type="object">ShuboTbcCommandPool</argument>
-        </arguments>
-    </type>
-
     <!-- Inject logger virtual type where needed -->
     <type name="Shubo\TbcPayment\Gateway\Http\Client\CreatePaymentClient">
         <arguments>
@@ -126,7 +119,7 @@
         </arguments>
     </type>
 
-    <type name="Shubo\TbcPayment\Controller\Payment\GetToken">
+    <type name="Shubo\TbcPayment\Controller\Payment\Params">
         <arguments>
             <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
         </arguments>

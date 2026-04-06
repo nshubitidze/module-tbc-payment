@@ -35,9 +35,6 @@ class ConfigProvider implements ConfigProviderInterface
                 self::CODE => [
                     'isActive' => true,
                     'title' => $this->config->getTitle(),
-                    'sdkUrl' => $this->config->getApiUrl() . '/latest/checkout-vue/checkout.js',
-                    'sdkCssUrl' => $this->config->getApiUrl() . '/latest/checkout-vue/checkout.css',
-                    'tokenUrl' => 'shubo_tbc/payment/gettoken',
                     'locale' => $this->resolveLocale(),
                 ],
             ],
