@@ -14,7 +14,7 @@ class Info extends PaymentInfo
     /**
      * @return array<string, string>
      */
-    protected function getSpecificInformation(): array
+    public function getSpecificInformation(): array
     {
         $info = [];
         $payment = $this->getInfo();
