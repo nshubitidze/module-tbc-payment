@@ -35,7 +35,7 @@
                 <field id="payment_action_mode" translate="label comment" type="select" sortOrder="50"
                        showInDefault="1" showInWebsite="1" showInStore="0">
                     <label>Payment Action</label>
-                    <comment><![CDATA[<strong>Authorize</strong>: charge immediately after 3DS. <strong>Authorize Only (Preauth)</strong>: hold funds on card, capture manually from admin later.]]></comment>
+                    <comment><![CDATA[<strong>Authorize & Capture</strong>: charge the card and create invoice automatically after payment approval.<br/><strong>Authorize Only</strong>: hold funds on card, review the order, then capture manually from admin using the "Capture Payment" button.]]></comment>
                     <source_model>Shubo\TbcPayment\Model\Config\Source\PaymentAction</source_model>
                 </field>
 

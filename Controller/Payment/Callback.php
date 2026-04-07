@@ -221,8 +221,7 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
             $paymentId = (string) ($callbackData['payment_id'] ?? '');
             if ($paymentId !== '') {
                 $payment->setTransactionId($paymentId);
-                $payment->setParentTransactionId($order->getIncrementId() . '-auth');
-            }
+                }
 
             $payment->setIsTransactionPending(false);
             $payment->setIsTransactionClosed(false);
@@ -241,7 +240,6 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
         $paymentId = (string) ($callbackData['payment_id'] ?? '');
         if ($paymentId !== '') {
             $payment->setTransactionId($paymentId);
-            $payment->setParentTransactionId($order->getIncrementId() . '-auth');
         }
 
         $payment->setIsTransactionPending(false);

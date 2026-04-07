@@ -148,9 +148,9 @@ define([
         },
 
         /**
-         * Override placeOrder: create Magento order FIRST (pending state),
-         * then submit payment to Flitt. This prevents charging customers
-         * without a corresponding order if order creation fails.
+         * Override placeOrder: submit payment to Flitt FIRST, then create
+         * the Magento order only after the bank approves the payment.
+         * This prevents ghost orders when card data is invalid or customer abandons 3DS.
          *
          * @param {Object} data
          * @param {Event} event
@@ -175,31 +175,52 @@ define([
             self.isProcessing(true);
             self.paymentError('');
 
-            // Step 1: Create Magento order FIRST (pending state)
-            self.getPlaceOrderDeferredObject()
-                .done(function () {
-                    // Step 2: Order created — now submit payment to Flitt
-                    var payment = self.paymentService.submit();
+            // Step 1: Submit payment to Flitt (validates card + 3DS)
+            var payment = self.paymentService.submit();
 
-                    payment.$on('success', function () {
+            payment.$on('success', function () {
+                // Step 2: Payment approved — now create Magento order
+                self.getPlaceOrderDeferredObject()
+                    .done(function () {
+                        // Step 3: Confirm with backend (checks Flitt API, captures, creates invoice)
+                        self.confirmPayment();
+                    })
+                    .fail(function () {
                         self.isProcessing(false);
-                        self.afterPlaceOrder();
+                        self.paymentError($t('Order could not be placed. Please try again.'));
                     });
+            });
 
-                    payment.$on('error', function (model) {
-                        self.isProcessing(false);
-                        var msg = model && model.attr
-                            ? model.attr('error.message')
-                            : $t('Payment was declined.');
-                        self.paymentError(msg);
-                    });
-                })
-                .fail(function () {
-                    self.isProcessing(false);
-                    self.paymentError($t('Order could not be placed. Please try again.'));
-                });
+            payment.$on('error', function (model) {
+                self.isProcessing(false);
+                var msg = model && model.attr
+                    ? model.attr('error.message')
+                    : $t('Payment was declined.');
+                self.paymentError(msg);
+            });
 
             return false;
+        },
+
+        /**
+         * Confirm payment with backend after Flitt success event.
+         * Calls the confirm endpoint which checks Flitt API and captures the payment.
+         * Redirects to success page regardless — the cron/callback will catch it if this fails.
+         */
+        confirmPayment: function () {
+            var self = this;
+
+            $.ajax({
+                url: urlBuilder.build('shubo_tbc/payment/confirm'),
+                type: 'POST',
+                dataType: 'json',
+                data: {
+                    form_key: window.FORM_KEY || ''
+                }
+            }).always(function () {
+                self.isProcessing(false);
+                self.afterPlaceOrder();
+            });
         },
 
         /**

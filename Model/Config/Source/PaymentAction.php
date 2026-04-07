@@ -17,8 +17,8 @@ class PaymentAction implements OptionSourceInterface
     public function toOptionArray(): array
     {
         return [
-            ['value' => 'authorize', 'label' => __('Authorize (Charge Immediately)')],
-            ['value' => 'preauth', 'label' => __('Authorize Only (Hold Funds)')],
+            ['value' => 'authorize', 'label' => __('Authorize & Capture (auto-invoice)')],
+            ['value' => 'preauth', 'label' => __('Authorize Only (capture manually from admin)')],
         ];
     }
 }

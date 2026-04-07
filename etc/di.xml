@@ -50,20 +50,9 @@
     <virtualType name="ShuboTbcCommandPool" type="Magento\Payment\Gateway\Command\CommandPool">
         <arguments>
             <argument name="commands" xsi:type="array">
-                <item name="authorize" xsi:type="string">ShuboTbcAuthorizeCommand</item>
                 <item name="initialize" xsi:type="string">ShuboTbcInitializeCommand</item>
                 <item name="refund" xsi:type="string">ShuboTbcRefundCommand</item>
             </argument>
-        </arguments>
-    </virtualType>
-
-    <!-- Authorize Command (marks payment as pending during order placement) -->
-    <virtualType name="ShuboTbcAuthorizeCommand" type="Magento\Payment\Gateway\Command\GatewayCommand">
-        <arguments>
-            <argument name="requestBuilder" xsi:type="object">Shubo\TbcPayment\Gateway\Request\AuthorizeRequestBuilder</argument>
-            <argument name="transferFactory" xsi:type="object">Shubo\TbcPayment\Gateway\Http\TransferFactory</argument>
-            <argument name="client" xsi:type="object">Shubo\TbcPayment\Gateway\Http\Client\NoOpClient</argument>
-            <argument name="handler" xsi:type="object">Shubo\TbcPayment\Gateway\Response\AuthorizeHandler</argument>
         </arguments>
     </virtualType>
 
@@ -125,6 +114,12 @@
     </type>
 
     <type name="Shubo\TbcPayment\Gateway\Validator\CallbackValidator">
+        <arguments>
+            <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
+        </arguments>
+    </type>
+
+    <type name="Shubo\TbcPayment\Controller\Payment\Confirm">
         <arguments>
             <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
         </arguments>
