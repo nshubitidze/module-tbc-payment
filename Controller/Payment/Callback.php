@@ -11,13 +11,15 @@ use Magento\Framework\App\RequestInterface;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\Controller\ResultInterface;
 use Magento\Framework\Serialize\Serializer\Json;
-use Magento\Sales\Api\InvoiceOrderInterface;
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
 use Magento\Framework\Api\SearchCriteriaBuilder;
 use Psr\Log\LoggerInterface;
+use Magento\Framework\App\ResourceConnection;
+use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
+use Shubo\TbcPayment\Service\SettlementService;
 
 /**
  * Handles Flitt server-to-server callback notifications.
@@ -28,14 +30,16 @@ use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
 class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
 {
     public function __construct(
-        private readonly RequestInterface $request,
+        private readonly \Magento\Framework\App\Request\Http $request,
         private readonly JsonFactory $jsonFactory,
         private readonly Json $jsonSerializer,
         private readonly OrderRepositoryInterface $orderRepository,
         private readonly SearchCriteriaBuilder $searchCriteriaBuilder,
-        private readonly InvoiceOrderInterface $invoiceOrder,
         private readonly CallbackValidator $callbackValidator,
+        private readonly SettlementService $settlementService,
+        private readonly Config $config,
         private readonly LoggerInterface $logger,
+        private readonly ResourceConnection $resourceConnection,
     ) {
     }
 
@@ -64,7 +68,10 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
                 return $result->setHttpResponseCode(400)->setData(['status' => 'error']);
             }
 
-            $order = $this->loadOrderByIncrementId((string) $orderId);
+            // Extract Magento increment ID from prefixed Flitt order_id
+            // Format: duka_{incrementId}_{timestamp}
+            $incrementId = $this->extractIncrementId((string) $orderId);
+            $order = $this->loadOrderByIncrementId($incrementId);
 
             if ($order === null) {
                 $this->logger->error('Flitt callback: order not found', ['order_id' => $orderId]);
@@ -80,7 +87,38 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
                 return $result->setHttpResponseCode(403)->setData(['status' => 'error']);
             }
 
-            $this->processCallback($order, $callbackData);
+            $connection = $this->resourceConnection->getConnection();
+            $connection->beginTransaction();
+            try {
+                // Re-load order inside transaction to get fresh state
+                $order = $this->loadOrderByIncrementId($incrementId);
+                if ($order === null) {
+                    $connection->rollBack();
+                    $this->logger->error('Flitt callback: order not found on reload', ['order_id' => $orderId]);
+                    return $result->setHttpResponseCode(404)->setData(['status' => 'error']);
+                }
+
+                $this->processCallback($order, $callbackData);
+                $connection->commit();
+            } catch (\Exception $e) {
+                $connection->rollBack();
+                throw $e;
+            }
+
+            // Trigger settlement if payment was approved and auto-settle is enabled
+            if (($callbackData['order_status'] ?? '') === 'approved') {
+                try {
+                    $this->settlementService->settle($order);
+                    // Save again to persist settlement additional info
+                    $this->orderRepository->save($order);
+                } catch (\Exception $e) {
+                    $this->logger->error('Settlement after callback failed', [
+                        'order_id' => $orderId,
+                        'error' => $e->getMessage(),
+                    ]);
+                    // Don't fail the callback response -- settlement can be retried
+                }
+            }
 
             return $result->setData(['status' => 'ok']);
         } catch (\Exception $e) {
@@ -103,10 +141,16 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
         $payment = $order->getPayment();
         $orderStatus = $callbackData['order_status'] ?? '';
 
+        // Store the full Flitt order_id so refunds can reference it
+        $payment->setAdditionalInformation('flitt_order_id', $callbackData['order_id'] ?? '');
+
         // Store callback data in payment additional info
         $infoKeys = [
             'payment_id', 'order_status', 'masked_card', 'rrn',
             'approval_code', 'tran_type', 'sender_email',
+            'card_type', 'card_bin', 'eci', 'fee',
+            'response_code', 'response_description',
+            'actual_amount', 'actual_currency',
         ];
 
         foreach ($infoKeys as $key) {
@@ -136,6 +180,14 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
                 $this->handleReversed($order, $callbackData);
                 break;
 
+            case 'created':
+            case 'processing':
+                $this->logger->info('Flitt callback: order in intermediate state', [
+                    'order_id' => $order->getIncrementId(),
+                    'order_status' => $orderStatus,
+                ]);
+                break;
+
             default:
                 $this->logger->warning('Flitt callback: unknown order_status', [
                     'order_id' => $order->getIncrementId(),
@@ -160,11 +212,42 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
             return; // Already processed, avoid double-processing
         }
 
+        $storeId = (int) $order->getStoreId();
+
+        if ($this->config->isPreauth($storeId)) {
+            $payment->setAdditionalInformation('awaiting_flitt_confirmation', false);
+            $payment->setAdditionalInformation('preauth_approved', true);
+
+            $paymentId = (string) ($callbackData['payment_id'] ?? '');
+            if ($paymentId !== '') {
+                $payment->setTransactionId($paymentId);
+                $payment->setParentTransactionId($order->getIncrementId() . '-auth');
+            }
+
+            $payment->setIsTransactionPending(false);
+            $payment->setIsTransactionClosed(false);
+
+            $order->setState(Order::STATE_PROCESSING);
+            $order->setStatus(Order::STATE_PROCESSING);
+            $order->addCommentToStatusHistory(
+                (string) __('Funds held by TBC Bank (preauth). Payment ID: %1. Use "Capture Payment" button to charge.', $callbackData['payment_id'] ?? 'N/A')
+            );
+            return;
+        }
+
+        $payment->setAdditionalInformation('awaiting_flitt_confirmation', false);
+
+        // Set the Flitt payment ID as transaction ID and link to the auth transaction
+        $paymentId = (string) ($callbackData['payment_id'] ?? '');
+        if ($paymentId !== '') {
+            $payment->setTransactionId($paymentId);
+            $payment->setParentTransactionId($order->getIncrementId() . '-auth');
+        }
+
         $payment->setIsTransactionPending(false);
         $payment->setIsTransactionClosed(true);
-        $payment->registerCaptureNotification(
-            ((float) ($callbackData['amount'] ?? $order->getGrandTotal() * 100)) / 100
-        );
+        $amountMinor = (int) ($callbackData['amount'] ?? (int) round($order->getGrandTotal() * 100));
+        $payment->registerCaptureNotification($amountMinor / 100);
 
         $order->setState(Order::STATE_PROCESSING);
         $order->setStatus(Order::STATE_PROCESSING);
@@ -181,6 +264,10 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
      */
     private function handleDeclined(Order $order, array $callbackData): void
     {
+        if ($order->getState() === Order::STATE_CANCELED) {
+            return;
+        }
+
         $order->cancel();
         $order->addCommentToStatusHistory(
             (string) __('Payment declined by TBC Bank. Reason: %1', $callbackData['error_message'] ?? 'N/A')
@@ -192,6 +279,10 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
      */
     private function handleExpired(Order $order): void
     {
+        if ($order->getState() === Order::STATE_CANCELED) {
+            return;
+        }
+
         $order->cancel();
         $order->addCommentToStatusHistory(
             (string) __('Payment session expired at TBC Bank.')
@@ -206,9 +297,28 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
      */
     private function handleReversed(Order $order, array $callbackData): void
     {
+        if ($order->getState() === Order::STATE_CLOSED) {
+            return;
+        }
+
         $order->addCommentToStatusHistory(
             (string) __('Payment reversed by TBC Bank. Transaction ID: %1', $callbackData['payment_id'] ?? 'N/A')
         );
+    }
+
+    /**
+     * Extract Magento increment ID from the Flitt order_id.
+     *
+     * Flitt order_id format: duka_{incrementId}_{timestamp}
+     * Falls back to the raw value if format doesn't match (e.g. legacy orders).
+     */
+    private function extractIncrementId(string $flittOrderId): string
+    {
+        if (preg_match('/^duka_(.+)_\d+$/', $flittOrderId, $matches)) {
+            return $matches[1];
+        }
+
+        return $flittOrderId;
     }
 
     /**

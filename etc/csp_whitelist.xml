@@ -32,5 +32,10 @@
                 <value id="flitt" type="host">https://pay.flitt.com</value>
             </values>
         </policy>
+        <policy id="form-action">
+            <values>
+                <value id="flitt" type="host">https://pay.flitt.com</value>
+            </values>
+        </policy>
     </policies>
 </csp_whitelist>

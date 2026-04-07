@@ -31,22 +31,27 @@ class RefundHandler implements HandlerInterface
         /** @var Payment $payment */
         $payment = $paymentDO->getPayment();
 
-        $reverseStatus = $response['reverse_status'] ?? '';
+        // Flitt wraps the response in {"response": {...}}
+        $responseData = $response['response'] ?? $response;
 
-        if ($reverseStatus !== 'approved' && $reverseStatus !== 'success') {
-            $errorMessage = $response['error_message'] ?? (string) __('Refund was declined by the payment gateway');
+        $reverseStatus = $responseData['reverse_status'] ?? '';
+        $responseStatus = $responseData['response_status'] ?? '';
+
+        if ($reverseStatus !== 'approved' && $responseStatus !== 'success') {
+            $errorMessage = $responseData['error_message']
+                ?? (string) __('Refund was declined by the payment gateway');
             throw new FlittApiException(__($errorMessage));
         }
 
-        $payment->setAdditionalInformation('refund_status', $reverseStatus);
+        $payment->setAdditionalInformation('refund_status', $reverseStatus ?: $responseStatus);
 
-        if (isset($response['reversal_amount'])) {
-            $payment->setAdditionalInformation('reversal_amount', $response['reversal_amount']);
+        if (isset($responseData['reversal_amount'])) {
+            $payment->setAdditionalInformation('reversal_amount', $responseData['reversal_amount']);
         }
 
-        if (isset($response['transaction_id'])) {
-            $payment->setTransactionId($response['transaction_id']);
-            $payment->setAdditionalInformation('refund_transaction_id', $response['transaction_id']);
+        if (isset($responseData['transaction_id'])) {
+            $payment->setTransactionId($responseData['transaction_id']);
+            $payment->setAdditionalInformation('refund_transaction_id', $responseData['transaction_id']);
         }
 
         $payment->setIsTransactionClosed(true);

@@ -67,10 +67,12 @@ define([
                 url: urlBuilder.build('shubo_tbc/payment/params'),
                 type: 'POST',
                 dataType: 'json',
-                data: {}
+                data: {
+                    form_key: window.FORM_KEY || ''
+                }
             }).done(function (response) {
-                if (response.success && response.params) {
-                    self.renderFlittEmbed(response.params);
+                if (response.success && response.token) {
+                    self.renderFlittEmbed(response.token);
                 } else {
                     self.paymentError(response.message || $t('Unable to load payment form.'));
                 }
@@ -82,24 +84,58 @@ define([
         /**
          * Render the Flitt Embed card form inside the container element.
          *
-         * @param {Object} params - Signed payment parameters from the backend.
+         * @param {string} token - Checkout token obtained from the Flitt API.
          */
-        renderFlittEmbed: function (params) {
+        renderFlittEmbed: function (token) {
             var self = this;
+            var config = window.checkoutConfig.payment.shubo_tbc || {};
 
             require(['flittCheckout'], function (checkout) {
                 try {
-                    self.paymentService = checkout('#shubo-tbc-embed-container', {
-                        options: {
-                            methods_disabled: ['banks', 'most_popular', 'wallets'],
-                            full_screen: false,
-                            show_pay_button: false,
-                            theme: {
-                                type: 'light',
-                                preset: 'reset'
+                    var methodsDisabled = ['banks', 'most_popular'];
+                    if (!config.enableWallets) {
+                        methodsDisabled.push('wallets');
+                    }
+
+                    var options = {
+                        methods_disabled: methodsDisabled,
+                        full_screen: false,
+                        show_pay_button: false,
+                        theme: {
+                            type: config.embedThemeType || 'light',
+                            preset: config.embedThemePreset || 'reset',
+                            layout: config.embedLayout || 'default'
+                        }
+                    };
+
+                    // Merge advanced JSON overrides
+                    if (config.embedOptionsJson) {
+                        try {
+                            var overrides = JSON.parse(config.embedOptionsJson);
+
+                            for (var key in overrides) {
+                                if (overrides.hasOwnProperty(key)) {
+                                    if (key === 'theme' && typeof overrides[key] === 'object') {
+                                        for (var tKey in overrides[key]) {
+                                            if (overrides[key].hasOwnProperty(tKey)) {
+                                                options.theme[tKey] = overrides[key][tKey];
+                                            }
+                                        }
+                                    } else {
+                                        options[key] = overrides[key];
+                                    }
+                                }
                             }
-                        },
-                        params: params
+                        } catch (e) {
+                            console.error('TBC: Invalid embed options JSON:', e);
+                        }
+                    }
+
+                    self.paymentService = checkout('#shubo-tbc-embed-container', {
+                        options: options,
+                        params: {
+                            token: token
+                        }
                     });
                     self.isEmbedLoaded(true);
                 } catch (e) {
@@ -112,8 +148,9 @@ define([
         },
 
         /**
-         * Override placeOrder: submit the embedded Flitt form first.
-         * Only create the Magento order AFTER payment succeeds.
+         * Override placeOrder: create Magento order FIRST (pending state),
+         * then submit payment to Flitt. This prevents charging customers
+         * without a corresponding order if order creation fails.
          *
          * @param {Object} data
          * @param {Event} event
@@ -138,27 +175,29 @@ define([
             self.isProcessing(true);
             self.paymentError('');
 
-            var payment = self.paymentService.submit();
+            // Step 1: Create Magento order FIRST (pending state)
+            self.getPlaceOrderDeferredObject()
+                .done(function () {
+                    // Step 2: Order created — now submit payment to Flitt
+                    var payment = self.paymentService.submit();
 
-            payment.$on('success', function () {
-                self.isProcessing(false);
-                self.getPlaceOrderDeferredObject()
-                    .done(function () {
-                        self.afterPlaceOrder();
-                    })
-                    .fail(function () {
+                    payment.$on('success', function () {
                         self.isProcessing(false);
-                        self.paymentError($t('Order could not be placed. Please try again.'));
+                        self.afterPlaceOrder();
                     });
-            });
 
-            payment.$on('error', function (model) {
-                self.isProcessing(false);
-                var msg = model && model.attr
-                    ? model.attr('error.message')
-                    : $t('Payment was declined.');
-                self.paymentError(msg);
-            });
+                    payment.$on('error', function (model) {
+                        self.isProcessing(false);
+                        var msg = model && model.attr
+                            ? model.attr('error.message')
+                            : $t('Payment was declined.');
+                        self.paymentError(msg);
+                    });
+                })
+                .fail(function () {
+                    self.isProcessing(false);
+                    self.paymentError($t('Order could not be placed. Please try again.'));
+                });
 
             return false;
         },

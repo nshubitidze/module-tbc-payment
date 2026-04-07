@@ -38,6 +38,7 @@ class RefundClient implements ClientInterface
         $storeId = $requestBody['__store_id'] ?? null;
         unset($requestBody['__store_id']);
 
+        // Flitt reverse endpoint uses the order_id in the URL path
         $url = $this->config->getApiUrl($storeId) . self::ENDPOINT;
 
         if ($this->config->isDebugEnabled($storeId)) {
@@ -50,8 +51,9 @@ class RefundClient implements ClientInterface
         try {
             $curl = $this->curlFactory->create();
             $curl->addHeader('Content-Type', 'application/json');
-            $curl->setOption(CURLOPT_TIMEOUT, 30);
-            $curl->post($url, $this->json->serialize($requestBody));
+            $curl->setOptions([CURLOPT_TIMEOUT => 30]);
+            // Flitt expects the body wrapped in {"request": {...}}
+            $curl->post($url, (string) $this->json->serialize(['request' => $requestBody]));
 
             $responseBody = $curl->getBody();
             $statusCode = $curl->getStatus();

@@ -6,18 +6,19 @@ namespace Shubo\TbcPayment\Gateway\Http\Client;
 
 use Magento\Framework\HTTP\Client\CurlFactory;
 use Magento\Framework\Serialize\Serializer\Json;
-use Magento\Payment\Gateway\Http\ClientInterface;
-use Magento\Payment\Gateway\Http\TransferInterface;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
 
 /**
- * HTTP client for creating Flitt checkout tokens.
+ * HTTP client for Flitt settlement (split payment distribution) operations.
+ *
+ * Settlement uses a different request format than other Flitt APIs:
+ * the order data is base64-encoded and the signature is sha1(password|base64_data).
  */
-class CreatePaymentClient implements ClientInterface
+class SettlementClient
 {
-    private const ENDPOINT = '/api/checkout/token';
+    private const ENDPOINT = '/api/settlement';
 
     public function __construct(
         private readonly Config $config,
@@ -28,22 +29,35 @@ class CreatePaymentClient implements ClientInterface
     }
 
     /**
-     * @param TransferInterface $transferObject
-     * @return array<string, mixed>
+     * Send settlement request to distribute funds to receivers.
+     *
+     * @param array<string, mixed> $orderData The "order" object data (will be base64-encoded)
+     * @param int $storeId Store ID for config lookup
+     * @return array<string, mixed> Flitt response
      * @throws FlittApiException
      */
-    public function placeRequest(TransferInterface $transferObject): array
+    public function settle(array $orderData, int $storeId): array
     {
-        $requestBody = $transferObject->getBody();
-        $storeId = $requestBody['__store_id'] ?? null;
-        unset($requestBody['__store_id']);
-
+        $password = $this->config->getPassword($storeId);
         $url = $this->config->getApiUrl($storeId) . self::ENDPOINT;
 
+        $dataJson = (string) $this->json->serialize(['order' => $orderData]);
+        $dataBase64 = base64_encode($dataJson);
+        /** @phpstan-ignore argument.type */
+        $signature = \Cloudipsp\Helper\ApiHelper::generateSignature($dataBase64, $password, '2.0');
+
+        $requestBody = (string) $this->json->serialize([
+            'request' => [
+                'version' => '2.0',
+                'data' => $dataBase64,
+                'signature' => $signature,
+            ],
+        ]);
+
         if ($this->config->isDebugEnabled($storeId)) {
-            $this->logger->debug('Flitt CreatePayment request', [
+            $this->logger->debug('Flitt Settlement request', [
                 'url' => $url,
-                'params' => $this->sanitizeForLog($requestBody),
+                'order_data' => $this->sanitizeForLog($orderData),
             ]);
         }
 
@@ -51,13 +65,13 @@ class CreatePaymentClient implements ClientInterface
             $curl = $this->curlFactory->create();
             $curl->addHeader('Content-Type', 'application/json');
             $curl->setOptions([CURLOPT_TIMEOUT => 30]);
-            $curl->post($url, (string) $this->json->serialize($requestBody));
+            $curl->post($url, $requestBody);
 
             $responseBody = $curl->getBody();
             $statusCode = $curl->getStatus();
 
             if ($this->config->isDebugEnabled($storeId)) {
-                $this->logger->debug('Flitt CreatePayment response', [
+                $this->logger->debug('Flitt Settlement response', [
                     'status' => $statusCode,
                     'body' => $responseBody,
                 ]);
@@ -65,25 +79,25 @@ class CreatePaymentClient implements ClientInterface
 
             if ($statusCode < 200 || $statusCode >= 300) {
                 throw new FlittApiException(
-                    __('Flitt API returned HTTP %1', $statusCode)
+                    __('Flitt settlement API returned HTTP %1', $statusCode)
                 );
             }
 
             $response = $this->json->unserialize($responseBody);
 
             if (!is_array($response)) {
-                throw new FlittApiException(__('Invalid response from Flitt API'));
+                throw new FlittApiException(__('Invalid settlement response from Flitt API'));
             }
 
             return $response;
         } catch (FlittApiException $e) {
             throw $e;
         } catch (\Exception $e) {
-            $this->logger->error('Flitt CreatePayment error: ' . $e->getMessage(), [
+            $this->logger->error('Flitt Settlement error: ' . $e->getMessage(), [
                 'exception' => $e,
             ]);
             throw new FlittApiException(
-                __('Unable to communicate with TBC payment gateway. Please try again.'),
+                __('Unable to process settlement via TBC payment gateway.'),
                 $e
             );
         }
@@ -98,10 +112,10 @@ class CreatePaymentClient implements ClientInterface
     private function sanitizeForLog(array $data): array
     {
         $sanitized = $data;
-        unset($sanitized['password'], $sanitized['signature']);
         if (isset($sanitized['merchant_id'])) {
             $sanitized['merchant_id'] = substr((string) $sanitized['merchant_id'], 0, 4) . '****';
         }
+        unset($sanitized['receiver']);
 
         return $sanitized;
     }

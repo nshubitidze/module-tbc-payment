@@ -32,6 +32,13 @@
                     <backend_model>Magento\Config\Model\Config\Backend\Encrypted</backend_model>
                 </field>
 
+                <field id="payment_action_mode" translate="label comment" type="select" sortOrder="50"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Payment Action</label>
+                    <comment><![CDATA[<strong>Authorize</strong>: charge immediately after 3DS. <strong>Authorize Only (Preauth)</strong>: hold funds on card, capture manually from admin later.]]></comment>
+                    <source_model>Shubo\TbcPayment\Model\Config\Source\PaymentAction</source_model>
+                </field>
+
                 <field id="sandbox_mode" translate="label" type="select" sortOrder="60"
                        showInDefault="1" showInWebsite="1" showInStore="0">
                     <label>Sandbox Mode</label>
@@ -57,6 +64,47 @@
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                 </field>
 
+                <field id="payment_lifetime" translate="label comment" type="text" sortOrder="92"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Payment Lifetime (seconds)</label>
+                    <comment>How long the payment session stays valid. Default: 3600 (1 hour). Max: 86400 (24 hours).</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+
+                <field id="embed_theme_type" translate="label comment" type="select" sortOrder="95"
+                       showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Checkout Theme</label>
+                    <comment>Flitt embed card form theme.</comment>
+                    <source_model>Shubo\TbcPayment\Model\Config\Source\ThemeType</source_model>
+                </field>
+
+                <field id="embed_theme_preset" translate="label comment" type="select" sortOrder="96"
+                       showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Checkout Theme Preset</label>
+                    <comment>Color preset for the card form.</comment>
+                    <source_model>Shubo\TbcPayment\Model\Config\Source\ThemePreset</source_model>
+                </field>
+
+                <field id="embed_layout" translate="label comment" type="select" sortOrder="97"
+                       showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Checkout Layout</label>
+                    <comment>Card form layout style.</comment>
+                    <source_model>Shubo\TbcPayment\Model\Config\Source\EmbedLayout</source_model>
+                </field>
+
+                <field id="embed_options_json" translate="label comment" type="textarea" sortOrder="98"
+                       showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Advanced Embed Options (JSON)</label>
+                    <comment><![CDATA[JSON object to override any Flitt embed option. Example: {"show_email": true, "show_fee": true, "logo_url": "https://example.com/logo.png"}. See <a href="https://docs.flitt.com/api/embedded-custom/" target="_blank">Flitt docs</a>.]]></comment>
+                </field>
+
+                <field id="enable_wallets" translate="label comment" type="select" sortOrder="99"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Enable Apple Pay / Google Pay</label>
+                    <comment>Allow customers to pay with Apple Pay and Google Pay in the checkout embed.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+
                 <field id="sort_order" translate="label" type="text" sortOrder="100"
                        showInDefault="1" showInWebsite="1" showInStore="0">
                     <label>Sort Order</label>
@@ -65,8 +113,37 @@
                 <field id="split_payments_enabled" translate="label comment" type="select" sortOrder="110"
                        showInDefault="1" showInWebsite="1" showInStore="0">
                     <label>Enable Split Payments</label>
-                    <comment>Allow splitting payments across multiple merchants.</comment>
+                    <comment><![CDATA[Split order payments with other Flitt merchants. The full payment is collected by your main Merchant ID above, then distributed to receivers below.]]></comment>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+
+                <field id="split_auto_settle" translate="label comment" type="select" sortOrder="115"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Auto-Settle After Approval</label>
+                    <comment>Automatically distribute funds to receivers as soon as the payment is approved.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <depends>
+                        <field id="split_payments_enabled">1</field>
+                    </depends>
+                </field>
+
+                <field id="split_receivers" translate="label comment" sortOrder="120"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Split Receivers</label>
+                    <comment><![CDATA[
+                        Add the Flitt merchants who should receive a portion of each payment.
+                        <strong>The remainder always stays with your main Merchant ID.</strong><br/><br/>
+                        <strong>Examples:</strong><br/>
+                        &bull; Give a partner 10%: add one receiver with Percentage = 10. Your merchant keeps 90%.<br/>
+                        &bull; Platform fee of 5 GEL per order: add one receiver (yourself) with Fixed Amount = 5.<br/>
+                        &bull; Two vendors, 60/40 split: add two receivers with Percentage = 60 and 40. Your merchant keeps 0%.<br/>
+                        &bull; Mixed: a fixed 2 GEL platform fee + vendor gets 100% of the rest: add receiver 1 (platform) Fixed = 2, receiver 2 (vendor) Percentage = 100.
+                    ]]></comment>
+                    <frontend_model>Shubo\TbcPayment\Block\Adminhtml\Form\Field\Receivers</frontend_model>
+                    <backend_model>Shubo\TbcPayment\Model\Config\Backend\Receivers</backend_model>
+                    <depends>
+                        <field id="split_payments_enabled">1</field>
+                    </depends>
                 </field>
             </group>
         </section>

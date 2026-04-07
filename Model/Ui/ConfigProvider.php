@@ -36,6 +36,11 @@ class ConfigProvider implements ConfigProviderInterface
                     'isActive' => true,
                     'title' => $this->config->getTitle(),
                     'locale' => $this->resolveLocale(),
+                    'embedThemeType' => $this->config->getEmbedThemeType(),
+                    'embedThemePreset' => $this->config->getEmbedThemePreset(),
+                    'embedLayout' => $this->config->getEmbedLayout(),
+                    'embedOptionsJson' => $this->config->getEmbedOptionsJson(),
+                    'enableWallets' => $this->config->isWalletsEnabled(),
                 ],
             ],
         ];

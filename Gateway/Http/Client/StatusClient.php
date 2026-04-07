@@ -6,19 +6,25 @@ namespace Shubo\TbcPayment\Gateway\Http\Client;
 
 use Magento\Framework\HTTP\Client\CurlFactory;
 use Magento\Framework\Serialize\Serializer\Json;
-use Magento\Payment\Gateway\Http\ClientInterface;
-use Magento\Payment\Gateway\Http\TransferInterface;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
 
 /**
- * HTTP client for creating Flitt checkout tokens.
+ * Standalone HTTP client for checking payment status via Flitt API.
+ *
+ * Not part of the gateway command pool — used directly by the cron reconciler.
  */
-class CreatePaymentClient implements ClientInterface
+class StatusClient
 {
-    private const ENDPOINT = '/api/checkout/token';
+    private const ENDPOINT = '/api/status/order_id';
 
+    /**
+     * @param Config $config
+     * @param CurlFactory $curlFactory
+     * @param Json $json
+     * @param LoggerInterface $logger
+     */
     public function __construct(
         private readonly Config $config,
         private readonly CurlFactory $curlFactory,
@@ -28,22 +34,32 @@ class CreatePaymentClient implements ClientInterface
     }
 
     /**
-     * @param TransferInterface $transferObject
-     * @return array<string, mixed>
+     * Check payment status for a given Flitt order ID.
+     *
+     * @param string $orderId The Flitt order_id (e.g. "duka_000000042_1743998765")
+     * @param int $storeId Store ID for config lookup
+     * @return array<string, mixed> Flitt response containing order_status, amount, payment_id, etc.
      * @throws FlittApiException
      */
-    public function placeRequest(TransferInterface $transferObject): array
+    public function checkStatus(string $orderId, int $storeId): array
     {
-        $requestBody = $transferObject->getBody();
-        $storeId = $requestBody['__store_id'] ?? null;
-        unset($requestBody['__store_id']);
+        $merchantId = $this->config->getMerchantId($storeId);
+        $password = $this->config->getPassword($storeId);
 
+        $params = [
+            'order_id' => $orderId,
+            'merchant_id' => $merchantId,
+        ];
+
+        $params['signature'] = Config::generateSignature($params, $password);
+
+        $requestBody = ['request' => $params];
         $url = $this->config->getApiUrl($storeId) . self::ENDPOINT;
 
         if ($this->config->isDebugEnabled($storeId)) {
-            $this->logger->debug('Flitt CreatePayment request', [
+            $this->logger->debug('Flitt Status request', [
                 'url' => $url,
-                'params' => $this->sanitizeForLog($requestBody),
+                'params' => $this->sanitizeForLog($params),
             ]);
         }
 
@@ -57,7 +73,7 @@ class CreatePaymentClient implements ClientInterface
             $statusCode = $curl->getStatus();
 
             if ($this->config->isDebugEnabled($storeId)) {
-                $this->logger->debug('Flitt CreatePayment response', [
+                $this->logger->debug('Flitt Status response', [
                     'status' => $statusCode,
                     'body' => $responseBody,
                 ]);
@@ -65,25 +81,26 @@ class CreatePaymentClient implements ClientInterface
 
             if ($statusCode < 200 || $statusCode >= 300) {
                 throw new FlittApiException(
-                    __('Flitt API returned HTTP %1', $statusCode)
+                    __('Flitt status API returned HTTP %1', $statusCode)
                 );
             }
 
             $response = $this->json->unserialize($responseBody);
 
             if (!is_array($response)) {
-                throw new FlittApiException(__('Invalid response from Flitt API'));
+                throw new FlittApiException(__('Invalid status response from Flitt API'));
             }
 
             return $response;
         } catch (FlittApiException $e) {
             throw $e;
         } catch (\Exception $e) {
-            $this->logger->error('Flitt CreatePayment error: ' . $e->getMessage(), [
+            $this->logger->error('Flitt Status error: ' . $e->getMessage(), [
                 'exception' => $e,
+                'order_id' => $orderId,
             ]);
             throw new FlittApiException(
-                __('Unable to communicate with TBC payment gateway. Please try again.'),
+                __('Unable to check payment status via TBC payment gateway.'),
                 $e
             );
         }
@@ -92,13 +109,13 @@ class CreatePaymentClient implements ClientInterface
     /**
      * Remove sensitive data before logging.
      *
-     * @param array<string, mixed> $data
+     * @param array<string, mixed> $data Data to sanitize
      * @return array<string, mixed>
      */
     private function sanitizeForLog(array $data): array
     {
         $sanitized = $data;
-        unset($sanitized['password'], $sanitized['signature']);
+        unset($sanitized['signature']);
         if (isset($sanitized['merchant_id'])) {
             $sanitized['merchant_id'] = substr((string) $sanitized['merchant_id'], 0, 4) . '****';
         }
