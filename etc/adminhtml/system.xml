@@ -5,8 +5,8 @@
         <section id="payment">
             <group id="shubo_tbc" translate="label comment" type="text" sortOrder="10" showInDefault="1"
                    showInWebsite="1" showInStore="1">
-                <label>TBC Bank (Flitt Embed)</label>
-                <comment><![CDATA[Accept card payments via TBC Bank using Flitt Embed SDK.]]></comment>
+                <label>TBC Bank (Flitt)</label>
+                <comment><![CDATA[Accept card payments via TBC Bank / Flitt. Supports embedded card form and redirect checkout.]]></comment>
 
                 <field id="active" translate="label" type="select" sortOrder="10"
                        showInDefault="1" showInWebsite="1" showInStore="0">
@@ -37,6 +37,50 @@
                     <label>Payment Action</label>
                     <comment><![CDATA[<strong>Authorize & Capture</strong>: charge the card and create invoice automatically after payment approval.<br/><strong>Authorize Only</strong>: hold funds on card, review the order, then capture manually from admin using the "Capture Payment" button.]]></comment>
                     <source_model>Shubo\TbcPayment\Model\Config\Source\PaymentAction</source_model>
+                </field>
+
+                <field id="checkout_type" translate="label comment" type="select" sortOrder="52"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Checkout Type</label>
+                    <comment><![CDATA[<strong>Embedded Card Form</strong>: card form renders directly in your checkout page. Customer never leaves your site.<br/><strong>Redirect to Payment Page</strong>: customer is redirected to the Flitt/TBC hosted payment page and returns after payment.]]></comment>
+                    <source_model>Shubo\TbcPayment\Model\Config\Source\CheckoutType</source_model>
+                </field>
+
+                <field id="brand_logo_url" translate="label comment" type="text" sortOrder="53"
+                       showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Payment Logo URL</label>
+                    <comment>URL to a logo image displayed above the card form. Leave empty to hide.</comment>
+                    <depends>
+                        <field id="checkout_type">embed</field>
+                    </depends>
+                </field>
+
+                <field id="brand_description" translate="label comment" type="text" sortOrder="54"
+                       showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Payment Description</label>
+                    <comment>Short text displayed under the logo. Translatable via i18n CSV files.</comment>
+                    <depends>
+                        <field id="checkout_type">embed</field>
+                    </depends>
+                </field>
+
+                <field id="brand_accent_color" translate="label comment" type="text" sortOrder="55"
+                       showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Accent Color</label>
+                    <comment><![CDATA[Hex color code (e.g. <strong>#00A3E0</strong>). Applied to the branding wrapper and the card form primary color. Leave empty to use the default theme preset color.]]></comment>
+                    <depends>
+                        <field id="checkout_type">embed</field>
+                    </depends>
+                </field>
+
+                <field id="brand_strip_provider" translate="label comment" type="select" sortOrder="56"
+                       showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Strip Provider Branding</label>
+                    <comment>Hides Flitt title, links, and security messages from the embedded card form for a cleaner look.</comment>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <depends>
+                        <field id="checkout_type">embed</field>
+                    </depends>
                 </field>
 
                 <field id="sandbox_mode" translate="label" type="select" sortOrder="60"
@@ -76,6 +120,9 @@
                     <label>Checkout Theme</label>
                     <comment>Flitt embed card form theme.</comment>
                     <source_model>Shubo\TbcPayment\Model\Config\Source\ThemeType</source_model>
+                    <depends>
+                        <field id="checkout_type">embed</field>
+                    </depends>
                 </field>
 
                 <field id="embed_theme_preset" translate="label comment" type="select" sortOrder="96"
@@ -83,6 +130,9 @@
                     <label>Checkout Theme Preset</label>
                     <comment>Color preset for the card form.</comment>
                     <source_model>Shubo\TbcPayment\Model\Config\Source\ThemePreset</source_model>
+                    <depends>
+                        <field id="checkout_type">embed</field>
+                    </depends>
                 </field>
 
                 <field id="embed_layout" translate="label comment" type="select" sortOrder="97"
@@ -90,12 +140,18 @@
                     <label>Checkout Layout</label>
                     <comment>Card form layout style.</comment>
                     <source_model>Shubo\TbcPayment\Model\Config\Source\EmbedLayout</source_model>
+                    <depends>
+                        <field id="checkout_type">embed</field>
+                    </depends>
                 </field>
 
                 <field id="embed_options_json" translate="label comment" type="textarea" sortOrder="98"
                        showInDefault="1" showInWebsite="1" showInStore="1">
                     <label>Advanced Embed Options (JSON)</label>
                     <comment><![CDATA[JSON object to override any Flitt embed option. Example: {"show_email": true, "show_fee": true, "logo_url": "https://example.com/logo.png"}. See <a href="https://docs.flitt.com/api/embedded-custom/" target="_blank">Flitt docs</a>.]]></comment>
+                    <depends>
+                        <field id="checkout_type">embed</field>
+                    </depends>
                 </field>
 
                 <field id="enable_wallets" translate="label comment" type="select" sortOrder="99"
@@ -103,6 +159,9 @@
                     <label>Enable Apple Pay / Google Pay</label>
                     <comment>Allow customers to pay with Apple Pay and Google Pay in the checkout embed.</comment>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <depends>
+                        <field id="checkout_type">embed</field>
+                    </depends>
                 </field>
 
                 <field id="sort_order" translate="label" type="text" sortOrder="100"

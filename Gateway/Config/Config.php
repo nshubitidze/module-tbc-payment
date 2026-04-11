@@ -31,6 +31,11 @@ class Config extends \Magento\Payment\Gateway\Config\Config
     private const KEY_ENABLE_WALLETS = 'enable_wallets';
     private const KEY_PAYMENT_LIFETIME = 'payment_lifetime';
     private const KEY_PAYMENT_ACTION_MODE = 'payment_action_mode';
+    private const KEY_CHECKOUT_TYPE = 'checkout_type';
+    private const KEY_BRAND_LOGO_URL = 'brand_logo_url';
+    private const KEY_BRAND_DESCRIPTION = 'brand_description';
+    private const KEY_BRAND_ACCENT_COLOR = 'brand_accent_color';
+    private const KEY_BRAND_STRIP_PROVIDER = 'brand_strip_provider';
 
     public function __construct(
         ScopeConfigInterface $scopeConfig,
@@ -135,6 +140,36 @@ class Config extends \Magento\Payment\Gateway\Config\Config
     public function isPreauth(?int $storeId = null): bool
     {
         return $this->getPaymentActionMode($storeId) === 'preauth';
+    }
+
+    public function getCheckoutType(?int $storeId = null): string
+    {
+        return (string) ($this->getValue(self::KEY_CHECKOUT_TYPE, $storeId) ?: 'embed');
+    }
+
+    public function isRedirectMode(?int $storeId = null): bool
+    {
+        return $this->getCheckoutType($storeId) === 'redirect';
+    }
+
+    public function getBrandLogoUrl(?int $storeId = null): string
+    {
+        return (string) ($this->getValue(self::KEY_BRAND_LOGO_URL, $storeId) ?: '');
+    }
+
+    public function getBrandDescription(?int $storeId = null): string
+    {
+        return (string) ($this->getValue(self::KEY_BRAND_DESCRIPTION, $storeId) ?: '');
+    }
+
+    public function getBrandAccentColor(?int $storeId = null): string
+    {
+        return (string) ($this->getValue(self::KEY_BRAND_ACCENT_COLOR, $storeId) ?: '');
+    }
+
+    public function shouldStripProviderBranding(?int $storeId = null): bool
+    {
+        return (bool) $this->getValue(self::KEY_BRAND_STRIP_PROVIDER, $storeId);
     }
 
     /**

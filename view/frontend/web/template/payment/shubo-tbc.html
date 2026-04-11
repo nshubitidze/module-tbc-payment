@@ -14,18 +14,38 @@
         <div class="message message-error error" data-bind="text: paymentError()"></div>
         <!-- /ko -->
 
-        <!-- Flitt card form renders here -->
-        <div id="shubo-tbc-embed-container" style="min-height: 100px;"></div>
+        <div class="shubo-tbc-payment-wrapper" data-bind="style: accentStyle()">
 
-        <!-- Loading indicator -->
-        <!-- ko if: !isEmbedLoaded() && !paymentError() -->
+            <!-- Branding header (only if logo or description configured) -->
+            <!-- ko if: hasBranding() -->
+            <div class="shubo-tbc-branding">
+                <!-- ko if: brandLogoUrl() -->
+                <img class="shubo-tbc-branding__logo"
+                     data-bind="attr: {src: brandLogoUrl()}" alt="" />
+                <!-- /ko -->
+                <!-- ko if: brandDescription() -->
+                <span class="shubo-tbc-branding__description"
+                      data-bind="text: brandDescription()"></span>
+                <!-- /ko -->
+            </div>
+            <!-- /ko -->
+
+            <!-- Flitt embed container (embed mode only) -->
+            <!-- ko if: isEmbedMode() -->
+            <div id="shubo-tbc-embed-container" style="min-height: 100px;"></div>
+            <!-- /ko -->
+
+        </div>
+
+        <!-- Loading indicator (embed mode only) -->
+        <!-- ko if: isEmbedMode() && !isEmbedLoaded() && !paymentError() -->
         <div style="text-align:center; padding:20px; color:#999;">
             <span data-bind="i18n: 'Loading secure payment form...'"></span>
         </div>
         <!-- /ko -->
 
         <!-- Billing address -->
-        <!-- ko if: isEmbedLoaded() -->
+        <!-- ko if: isEmbedMode() ? isEmbedLoaded() : true -->
         <div class="payment-method-billing-address">
             <!-- ko foreach: $parent.getRegion('billingAddress') -->
             <!-- ko template: getTemplate() --><!-- /ko -->
@@ -34,7 +54,7 @@
         <!-- /ko -->
 
         <!-- Place Order button -->
-        <!-- ko if: isEmbedLoaded() && !isProcessing() -->
+        <!-- ko if: isEmbedMode() ? (isEmbedLoaded() && !isProcessing()) : !isProcessing() -->
         <div class="actions-toolbar">
             <div class="primary">
                 <button class="action primary checkout" type="submit"

@@ -21,8 +21,6 @@ define([
         },
 
         /**
-         * Get payment method code.
-         *
          * @returns {string}
          */
         getCode: function () {
@@ -30,23 +28,81 @@ define([
         },
 
         /**
-         * Check if payment method is active (selected).
-         *
+         * @returns {Object}
+         */
+        getConfig: function () {
+            return window.checkoutConfig.payment.shubo_tbc || {};
+        },
+
+        /**
          * @returns {boolean}
          */
         isActive: function () {
             return this.getCode() === this.isChecked();
         },
 
+        // --- Mode helpers ---
+
         /**
-         * When customer selects this payment method, load the Flitt embed form.
+         * @returns {boolean}
+         */
+        isEmbedMode: function () {
+            return this.getConfig().checkoutType !== 'redirect';
+        },
+
+        /**
+         * @returns {boolean}
+         */
+        isRedirectMode: function () {
+            return this.getConfig().checkoutType === 'redirect';
+        },
+
+        // --- Branding helpers ---
+
+        /**
+         * @returns {string}
+         */
+        brandLogoUrl: function () {
+            return this.getConfig().brandLogoUrl || '';
+        },
+
+        /**
+         * @returns {string}
+         */
+        brandDescription: function () {
+            return this.getConfig().brandDescription || '';
+        },
+
+        /**
+         * @returns {boolean}
+         */
+        hasBranding: function () {
+            return this.brandLogoUrl() !== '' || this.brandDescription() !== '';
+        },
+
+        /**
+         * Returns inline style object setting the accent CSS variable.
+         * @returns {Object|boolean}
+         */
+        accentStyle: function () {
+            var color = this.getConfig().brandAccentColor || '';
+
+            if (color) {
+                return {'--shubo-tbc-accent': color};
+            }
+
+            return {};
+        },
+
+        /**
+         * When customer selects this payment method, load the Flitt embed (embed mode only).
          *
          * @returns {boolean}
          */
         selectPaymentMethod: function () {
             this._super();
 
-            if (!this.paymentService) {
+            if (this.isEmbedMode() && !this.paymentService) {
                 this.initEmbed();
             }
 
@@ -55,8 +111,6 @@ define([
 
         /**
          * Fetch signed payment params from backend and initialize the Flitt embed form.
-         * The backend generates a signature using the merchant secret — the secret
-         * itself is never sent to the frontend.
          */
         initEmbed: function () {
             var self = this;
@@ -84,11 +138,11 @@ define([
         /**
          * Render the Flitt Embed card form inside the container element.
          *
-         * @param {string} token - Checkout token obtained from the Flitt API.
+         * @param {string} token
          */
         renderFlittEmbed: function (token) {
             var self = this;
-            var config = window.checkoutConfig.payment.shubo_tbc || {};
+            var config = this.getConfig();
 
             require(['flittCheckout'], function (checkout) {
                 try {
@@ -108,7 +162,28 @@ define([
                         }
                     };
 
-                    // Merge advanced JSON overrides
+                    // --- Branding: accent color overrides ---
+                    var accentColor = config.brandAccentColor || '';
+                    var cssVariable = {};
+
+                    if (accentColor) {
+                        options.theme.preset = 'reset';
+                        cssVariable.main = accentColor;
+                    }
+
+                    // --- Branding: logo ---
+                    if (config.brandLogoUrl) {
+                        options.logo_url = config.brandLogoUrl;
+                    }
+
+                    // --- Branding: strip provider branding ---
+                    if (config.brandStripProvider) {
+                        options.show_title = false;
+                        options.show_link = false;
+                        options.show_secure_message = false;
+                    }
+
+                    // --- Advanced JSON overrides (power users) ---
                     if (config.embedOptionsJson) {
                         try {
                             var overrides = JSON.parse(config.embedOptionsJson);
@@ -121,6 +196,12 @@ define([
                                                 options.theme[tKey] = overrides[key][tKey];
                                             }
                                         }
+                                    } else if (key === 'css_variable' && typeof overrides[key] === 'object') {
+                                        for (var cKey in overrides[key]) {
+                                            if (overrides[key].hasOwnProperty(cKey)) {
+                                                cssVariable[cKey] = overrides[key][cKey];
+                                            }
+                                        }
                                     } else {
                                         options[key] = overrides[key];
                                     }
@@ -131,12 +212,19 @@ define([
                         }
                     }
 
-                    self.paymentService = checkout('#shubo-tbc-embed-container', {
+                    var checkoutOptions = {
                         options: options,
                         params: {
                             token: token
                         }
-                    });
+                    };
+
+                    // Apply css_variable at the top level (Flitt SDK requirement)
+                    if (Object.keys(cssVariable).length > 0) {
+                        checkoutOptions.css_variable = cssVariable;
+                    }
+
+                    self.paymentService = checkout('#shubo-tbc-embed-container', checkoutOptions);
                     self.isEmbedLoaded(true);
                 } catch (e) {
                     self.paymentError($t('Unable to render payment form.'));
@@ -148,9 +236,10 @@ define([
         },
 
         /**
-         * Override placeOrder: submit payment to Flitt FIRST, then create
-         * the Magento order only after the bank approves the payment.
-         * This prevents ghost orders when card data is invalid or customer abandons 3DS.
+         * Place order: branches between embed and redirect flows.
+         *
+         * EMBED: Submit payment to Flitt FIRST, then create Magento order.
+         * REDIRECT: Create Magento order FIRST, then redirect to Flitt.
          *
          * @param {Object} data
          * @param {Event} event
@@ -159,30 +248,43 @@ define([
         placeOrder: function (data, event) {
             var self = this;
 
-            if (!self.paymentService) {
-                self.paymentError($t('Payment form not loaded.'));
-                return false;
+            if (event) {
+                event.preventDefault();
             }
 
             if (!self.validate()) {
                 return false;
             }
 
-            if (event) {
-                event.preventDefault();
+            if (self.isRedirectMode()) {
+                return self.placeOrderRedirect();
+            }
+
+            return self.placeOrderEmbed();
+        },
+
+        /**
+         * Embed flow: Flitt approves first, then Magento order, then confirm.
+         * Prevents ghost orders when card is invalid or customer abandons 3DS.
+         *
+         * @returns {boolean}
+         */
+        placeOrderEmbed: function () {
+            var self = this;
+
+            if (!self.paymentService) {
+                self.paymentError($t('Payment form not loaded.'));
+                return false;
             }
 
             self.isProcessing(true);
             self.paymentError('');
 
-            // Step 1: Submit payment to Flitt (validates card + 3DS)
             var payment = self.paymentService.submit();
 
             payment.$on('success', function () {
-                // Step 2: Payment approved — now create Magento order
                 self.getPlaceOrderDeferredObject()
                     .done(function () {
-                        // Step 3: Confirm with backend (checks Flitt API, captures, creates invoice)
                         self.confirmPayment();
                     })
                     .fail(function () {
@@ -203,9 +305,56 @@ define([
         },
 
         /**
-         * Confirm payment with backend after Flitt success event.
-         * Calls the confirm endpoint which checks Flitt API and captures the payment.
-         * Redirects to success page regardless — the cron/callback will catch it if this fails.
+         * Redirect flow: Create Magento order first, then redirect to Flitt.
+         *
+         * @returns {boolean}
+         */
+        placeOrderRedirect: function () {
+            var self = this;
+
+            self.isProcessing(true);
+            self.paymentError('');
+
+            self.getPlaceOrderDeferredObject()
+                .done(function () {
+                    self.initiateRedirect();
+                })
+                .fail(function () {
+                    self.isProcessing(false);
+                    self.paymentError($t('Order could not be placed. Please try again.'));
+                });
+
+            return false;
+        },
+
+        /**
+         * Call the redirect endpoint to get the Flitt checkout URL, then redirect.
+         */
+        initiateRedirect: function () {
+            var self = this;
+
+            $.ajax({
+                url: urlBuilder.build('shubo_tbc/payment/redirect'),
+                type: 'POST',
+                dataType: 'json',
+                data: {
+                    form_key: window.FORM_KEY || ''
+                }
+            }).done(function (response) {
+                if (response.success && response.checkout_url) {
+                    window.location.href = response.checkout_url;
+                } else {
+                    self.isProcessing(false);
+                    self.paymentError(response.message || $t('Unable to redirect to payment page.'));
+                }
+            }).fail(function () {
+                self.isProcessing(false);
+                self.paymentError($t('Unable to connect to payment service.'));
+            });
+        },
+
+        /**
+         * Confirm payment with backend after Flitt embed success event.
          */
         confirmPayment: function () {
             var self = this;
@@ -224,15 +373,13 @@ define([
         },
 
         /**
-         * After Magento order is placed, redirect to the success page.
+         * After order is placed, redirect to the success page.
          */
         afterPlaceOrder: function () {
             redirectOnSuccessAction.execute();
         },
 
         /**
-         * Return payment data for order placement.
-         *
          * @returns {Object}
          */
         getData: function () {

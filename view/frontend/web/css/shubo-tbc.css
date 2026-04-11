@@ -1,0 +1,37 @@
+/**
+ * TBC Payment — Branding wrapper styles.
+ *
+ * Uses --shubo-tbc-accent CSS custom property set by the JS component
+ * from the admin "Accent Color" config. Merchants can override these
+ * styles in their Magento theme.
+ */
+
+.shubo-tbc-payment-wrapper {
+    --shubo-tbc-accent: #333333;
+}
+
+.shubo-tbc-branding {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px 12px;
+    margin-bottom: 12px;
+    border-bottom: 2px solid var(--shubo-tbc-accent);
+}
+
+.shubo-tbc-branding__logo {
+    max-height: 40px;
+    width: auto;
+    margin-bottom: 8px;
+}
+
+.shubo-tbc-branding__description {
+    font-size: 14px;
+    color: #555555;
+    text-align: center;
+}
+
+/* When accent color is set, style the Place Order button border */
+.shubo-tbc-payment-wrapper .action.primary.checkout {
+    border-color: var(--shubo-tbc-accent);
+}

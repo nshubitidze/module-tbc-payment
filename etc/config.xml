@@ -30,6 +30,11 @@
                 <enable_wallets>0</enable_wallets>
                 <payment_action_mode>authorize</payment_action_mode>
                 <payment_lifetime>3600</payment_lifetime>
+                <checkout_type>embed</checkout_type>
+                <brand_logo_url></brand_logo_url>
+                <brand_description></brand_description>
+                <brand_accent_color></brand_accent_color>
+                <brand_strip_provider>0</brand_strip_provider>
             </shubo_tbc>
         </payment>
     </default>
