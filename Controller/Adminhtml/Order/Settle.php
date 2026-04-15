@@ -17,7 +17,7 @@ use Shubo\TbcPayment\Service\SettlementService;
  */
 class Settle extends Action
 {
-    public const ADMIN_RESOURCE = 'Magento_Sales::actions_edit';
+    public const ADMIN_RESOURCE = 'Shubo_TbcPayment::settle';
 
     /**
      * @param Context $context

@@ -19,7 +19,7 @@ use Shubo\TbcPayment\Gateway\Http\Client\CaptureClient;
  */
 class Capture extends Action
 {
-    public const ADMIN_RESOURCE = 'Magento_Sales::actions_edit';
+    public const ADMIN_RESOURCE = 'Shubo_TbcPayment::capture';
 
     public function __construct(
         Context $context,
