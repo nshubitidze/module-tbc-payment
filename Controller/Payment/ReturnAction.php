@@ -10,6 +10,7 @@ use Magento\Framework\App\Action\HttpGetActionInterface;
 use Magento\Framework\App\CsrfAwareActionInterface;
 use Magento\Framework\App\Request\InvalidRequestException;
 use Magento\Framework\App\RequestInterface;
+use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\Controller\Result\Redirect;
 use Magento\Framework\Controller\Result\RedirectFactory;
 use Magento\Framework\Controller\ResultInterface;
@@ -60,6 +61,7 @@ class ReturnAction implements HttpGetActionInterface, CsrfAwareActionInterface
         private readonly MessageManager $messageManager,
         private readonly Config $config,
         private readonly LoggerInterface $logger,
+        private readonly ResourceConnection $resourceConnection,
     ) {
     }
 
@@ -164,6 +166,9 @@ class ReturnAction implements HttpGetActionInterface, CsrfAwareActionInterface
     /**
      * Handle an approved Flitt payment: validate signature, update order, trigger settlement.
      *
+     * Runs the order/invoice mutation under a row lock + DB transaction so a
+     * concurrent Callback or PendingOrderReconciler invocation can't double-invoice.
+     *
      * @param Order $order
      * @param array<string, mixed> $responseData Flitt status API response payload
      * @param Redirect $redirect
@@ -185,57 +190,106 @@ class ReturnAction implements HttpGetActionInterface, CsrfAwareActionInterface
             return $redirect->setPath('checkout/onepage/failure');
         }
 
-        /** @var Payment $payment */
-        $payment = $order->getPayment();
-
-        $this->storePaymentDetails($payment, $responseData);
+        $connection = $this->resourceConnection->getConnection();
+        $connection->beginTransaction();
 
         $paymentId = (string) ($responseData['payment_id'] ?? '');
-        if ($paymentId !== '') {
-            $payment->setTransactionId($paymentId);
-            $payment->setParentTransactionId($order->getIncrementId() . '-auth');
-        }
-
-        if ($this->config->isPreauth($storeId)) {
-            $payment->setAdditionalInformation('preauth_approved', true);
-            $payment->setIsTransactionPending(false);
-            $payment->setIsTransactionClosed(false);
-            $order->setState(Order::STATE_PROCESSING);
-            $order->setStatus(Order::STATE_PROCESSING);
-            $order->addCommentToStatusHistory(
-                (string) __(
-                    'Funds held by TBC Bank (redirect). Payment ID: %1. Use "Capture Payment" to charge.',
-                    $paymentId
-                )
-            );
-        } else {
-            $amountMinor = (int) ($responseData['amount'] ?? (int) round($order->getGrandTotal() * 100));
-            $payment->setIsTransactionPending(false);
-            $payment->setIsTransactionClosed(true);
-            $payment->registerCaptureNotification($amountMinor / 100);
-            $order->setState(Order::STATE_PROCESSING);
-            $order->setStatus(Order::STATE_PROCESSING);
-            $order->addCommentToStatusHistory(
-                (string) __('Payment approved by TBC Bank (redirect). Payment ID: %1', $paymentId)
-            );
-        }
-
-        $this->orderRepository->save($order);
+        $processedOrder = null;
 
         try {
-            $this->settlementService->settle($order);
-            $this->orderRepository->save($order);
+            // Row-level lock so concurrent Callback/Confirm/Cron cannot also
+            // create an invoice for this order.
+            $orderTable = $this->resourceConnection->getTableName('sales_order');
+            $select = $connection->select()
+                ->from($orderTable, ['entity_id', 'state'])
+                ->where('entity_id = ?', (int) $order->getEntityId())
+                ->forUpdate(true);
+            $row = $connection->fetchRow($select);
+
+            if ($row === false) {
+                $connection->rollBack();
+                $this->logger->warning('TBC Return: order row vanished under lock', [
+                    'order_id' => $order->getIncrementId(),
+                ]);
+                return $redirect->setPath('checkout/onepage/failure');
+            }
+
+            // Re-load to get an up-to-date snapshot inside the locked region.
+            // The repository return type is OrderInterface, but it is in fact
+            // always an Order in core; we narrow the type for tooling here.
+            /** @var Order $freshOrder */
+            $freshOrder = $this->orderRepository->get((int) $order->getEntityId());
+
+            if ($freshOrder->getState() === Order::STATE_PROCESSING) {
+                // Another path already finalised this order — just send the
+                // customer to success without touching state.
+                $connection->commit();
+                $this->setCheckoutSessionData($freshOrder);
+                $this->logger->info('TBC Return: already processed by concurrent path', [
+                    'order_id' => $freshOrder->getIncrementId(),
+                ]);
+                return $redirect->setPath('checkout/onepage/success');
+            }
+
+            /** @var Payment $payment */
+            $payment = $freshOrder->getPayment();
+
+            $this->storePaymentDetails($payment, $responseData);
+
+            if ($paymentId !== '') {
+                $payment->setTransactionId($paymentId);
+                $payment->setParentTransactionId($freshOrder->getIncrementId() . '-auth');
+            }
+
+            if ($this->config->isPreauth($storeId)) {
+                $payment->setAdditionalInformation('preauth_approved', true);
+                $payment->setIsTransactionPending(false);
+                $payment->setIsTransactionClosed(false);
+                $freshOrder->setState(Order::STATE_PROCESSING);
+                $freshOrder->setStatus(Order::STATE_PROCESSING);
+                $freshOrder->addCommentToStatusHistory(
+                    (string) __(
+                        'Funds held by TBC Bank (redirect). Payment ID: %1. Use "Capture Payment" to charge.',
+                        $paymentId
+                    )
+                );
+            } else {
+                $amountMinor = (int) ($responseData['amount']
+                    ?? (int) round($freshOrder->getGrandTotal() * 100));
+                $payment->setIsTransactionPending(false);
+                $payment->setIsTransactionClosed(true);
+                $payment->registerCaptureNotification($amountMinor / 100);
+                $freshOrder->setState(Order::STATE_PROCESSING);
+                $freshOrder->setStatus(Order::STATE_PROCESSING);
+                $freshOrder->addCommentToStatusHistory(
+                    (string) __('Payment approved by TBC Bank (redirect). Payment ID: %1', $paymentId)
+                );
+            }
+
+            $this->orderRepository->save($freshOrder);
+            $connection->commit();
+            $processedOrder = $freshOrder;
+        } catch (\Exception $e) {
+            $connection->rollBack();
+            throw $e;
+        }
+
+        // Settlement runs OUTSIDE the order transaction so it never holds the
+        // row lock during an external HTTP call.
+        try {
+            $this->settlementService->settle($processedOrder);
+            $this->orderRepository->save($processedOrder);
         } catch (\Exception $e) {
             $this->logger->error('TBC Return: settlement failed', [
-                'order_id' => $order->getIncrementId(),
+                'order_id' => $processedOrder->getIncrementId(),
                 'error'    => $e->getMessage(),
             ]);
         }
 
-        $this->setCheckoutSessionData($order);
+        $this->setCheckoutSessionData($processedOrder);
 
         $this->logger->info('TBC Return: order approved', [
-            'order_id'   => $order->getIncrementId(),
+            'order_id'   => $processedOrder->getIncrementId(),
             'payment_id' => $paymentId,
         ]);
 

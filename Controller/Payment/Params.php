@@ -160,6 +160,12 @@ class Params implements HttpPostActionInterface
 
         $curl = $this->curlFactory->create();
         $curl->addHeader('Content-Type', 'application/json');
+        // Bound the API call so a hung Flitt token endpoint cannot exhaust PHP workers.
+        $curl->setTimeout(30);
+        $curl->setOptions([
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_CONNECTTIMEOUT => 10,
+        ]);
         $curl->post($tokenUrl, (string) $requestBody);
 
         $responseBody = $curl->getBody();

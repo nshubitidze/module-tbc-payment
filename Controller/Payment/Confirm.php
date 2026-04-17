@@ -5,7 +5,10 @@ declare(strict_types=1);
 namespace Shubo\TbcPayment\Controller\Payment;
 
 use Magento\Checkout\Model\Session as CheckoutSession;
+use Magento\Framework\Api\SearchCriteriaBuilder;
 use Magento\Framework\App\Action\HttpPostActionInterface;
+use Magento\Framework\App\ResourceConnection;
+use Magento\Framework\Controller\Result\Json as JsonResult;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\Controller\ResultInterface;
 use Magento\Sales\Api\OrderRepositoryInterface;
@@ -23,6 +26,12 @@ use Shubo\TbcPayment\Service\SettlementService;
  * Checks the Flitt API for the real payment status and processes the order
  * immediately, so the customer doesn't have to wait for the server callback
  * or the cron reconciler.
+ *
+ * Race-safety: Callback (server-to-server) and PendingOrderReconciler can run
+ * concurrently with this controller. We wrap the order load + state check +
+ * approval inside a DB transaction with a SELECT ... FOR UPDATE on the order
+ * row so only one of the three paths can transition the order to PROCESSING
+ * and create the invoice.
  */
 class Confirm implements HttpPostActionInterface
 {
@@ -35,40 +44,43 @@ class Confirm implements HttpPostActionInterface
         private readonly Config $config,
         private readonly SettlementService $settlementService,
         private readonly LoggerInterface $logger,
+        private readonly ResourceConnection $resourceConnection,
+        private readonly SearchCriteriaBuilder $searchCriteriaBuilder,
     ) {
     }
 
     public function execute(): ResultInterface
     {
+        /** @var JsonResult $result */
         $result = $this->jsonFactory->create();
 
         try {
-            $order = $this->checkoutSession->getLastRealOrder();
+            $sessionOrder = $this->checkoutSession->getLastRealOrder();
 
-            if (!$order || !$order->getEntityId()) {
-                return $result->setData(['success' => false, 'message' => 'No order found.']);
+            if (!$sessionOrder || !$sessionOrder->getEntityId()) {
+                return $result->setData(['success' => false, 'message' => (string) __('No order found.')]);
             }
 
-            /** @var Payment $payment */
-            $payment = $order->getPayment();
-            $flittOrderId = (string) $payment->getAdditionalInformation('flitt_order_id');
+            /** @var Payment $sessionPayment */
+            $sessionPayment = $sessionOrder->getPayment();
+            $flittOrderId = (string) $sessionPayment->getAdditionalInformation('flitt_order_id');
 
             if ($flittOrderId === '') {
-                return $result->setData(['success' => false, 'message' => 'No Flitt order ID.']);
+                return $result->setData(['success' => false, 'message' => (string) __('No Flitt order ID.')]);
             }
 
-            // Already processed — skip
-            if ($order->getState() === Order::STATE_PROCESSING) {
+            // Fast pre-check before doing any external API call: skip if already done.
+            if ($sessionOrder->getState() === Order::STATE_PROCESSING) {
                 return $result->setData(['success' => true, 'already_processed' => true]);
             }
 
-            $storeId = (int) $order->getStoreId();
+            $storeId = (int) $sessionOrder->getStoreId();
             $response = $this->statusClient->checkStatus($flittOrderId, $storeId);
             $responseData = $response['response'] ?? $response;
             $flittStatus = $responseData['order_status'] ?? '';
 
             $this->logger->info('TBC confirm: Flitt status check', [
-                'order_id' => $order->getIncrementId(),
+                'order_id' => $sessionOrder->getIncrementId(),
                 'flitt_status' => $flittStatus,
             ]);
 
@@ -76,29 +88,39 @@ class Confirm implements HttpPostActionInterface
                 return $result->setData([
                     'success' => false,
                     'flitt_status' => $flittStatus,
-                    'message' => 'Payment not yet approved.',
+                    'message' => (string) __('Payment not yet approved.'),
                 ]);
             }
 
             if (!$this->callbackValidator->validate($responseData, $storeId)) {
                 $this->logger->error('TBC confirm: signature validation failed', [
-                    'order_id' => $order->getIncrementId(),
+                    'order_id' => $sessionOrder->getIncrementId(),
                 ]);
-                return $result->setData(['success' => false, 'message' => 'Signature validation failed.']);
+                return $result->setData([
+                    'success' => false,
+                    'message' => (string) __('Signature validation failed.'),
+                ]);
             }
 
-            $this->processApproval($order, $payment, $responseData, $storeId);
-            $this->orderRepository->save($order);
+            $order = $this->processWithLock(
+                (int) $sessionOrder->getEntityId(),
+                $sessionOrder->getIncrementId(),
+                $responseData,
+                $storeId,
+            );
 
-            // Trigger settlement if configured
-            try {
-                $this->settlementService->settle($order);
-                $this->orderRepository->save($order);
-            } catch (\Exception $e) {
-                $this->logger->error('TBC confirm: settlement failed', [
-                    'order_id' => $order->getIncrementId(),
-                    'error' => $e->getMessage(),
-                ]);
+            // Trigger settlement OUTSIDE the order transaction; settlement does its own
+            // external HTTP call and we don't want to hold the row lock during it.
+            if ($order !== null) {
+                try {
+                    $this->settlementService->settle($order);
+                    $this->orderRepository->save($order);
+                } catch (\Exception $e) {
+                    $this->logger->error('TBC confirm: settlement failed', [
+                        'order_id' => $order->getIncrementId(),
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             }
 
             return $result->setData(['success' => true]);
@@ -107,8 +129,99 @@ class Confirm implements HttpPostActionInterface
                 'exception' => $e,
             ]);
 
-            return $result->setData(['success' => false, 'message' => 'Unable to confirm payment.']);
+            return $result->setData([
+                'success' => false,
+                'message' => (string) __('Unable to confirm payment.'),
+            ]);
         }
+    }
+
+    /**
+     * Acquire a row-level lock on the order, re-check state, and process the approval.
+     *
+     * Returns the processed order (so the caller can run settlement after commit) or
+     * null if another path beat us to it.
+     *
+     * @param array<string, mixed> $responseData
+     */
+    private function processWithLock(
+        int $orderEntityId,
+        string $incrementId,
+        array $responseData,
+        int $storeId,
+    ): ?Order {
+        $connection = $this->resourceConnection->getConnection();
+        $connection->beginTransaction();
+
+        try {
+            // SELECT ... FOR UPDATE on the order row blocks concurrent
+            // Callback / Confirm / Cron processing for the same order.
+            $orderTable = $this->resourceConnection->getTableName('sales_order');
+            $select = $connection->select()
+                ->from($orderTable, ['entity_id', 'state'])
+                ->where('entity_id = ?', $orderEntityId)
+                ->forUpdate(true);
+            $row = $connection->fetchRow($select);
+
+            if ($row === false) {
+                $connection->rollBack();
+                $this->logger->warning('TBC confirm: order row vanished under lock', [
+                    'order_id' => $incrementId,
+                ]);
+                return null;
+            }
+
+            // Re-load via the repository so we get the full domain object.
+            $order = $this->loadOrder($incrementId);
+
+            if ($order === null) {
+                $connection->rollBack();
+                $this->logger->warning('TBC confirm: order disappeared between lock and reload', [
+                    'order_id' => $incrementId,
+                ]);
+                return null;
+            }
+
+            // Idempotent check INSIDE the locked region: if another path
+            // already promoted the order, do nothing.
+            if ($order->getState() === Order::STATE_PROCESSING) {
+                $connection->commit();
+                $this->logger->info('TBC confirm: already processed by concurrent path', [
+                    'order_id' => $incrementId,
+                ]);
+                return null;
+            }
+
+            /** @var Payment $payment */
+            $payment = $order->getPayment();
+            $this->processApproval($order, $payment, $responseData, $storeId);
+            $this->orderRepository->save($order);
+
+            $connection->commit();
+
+            return $order;
+        } catch (\Exception $e) {
+            $connection->rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Load an order by increment ID via the repository.
+     */
+    private function loadOrder(string $incrementId): ?Order
+    {
+        $searchCriteria = $this->searchCriteriaBuilder
+            ->addFilter('increment_id', $incrementId)
+            ->setPageSize(1)
+            ->create();
+
+        $orders = $this->orderRepository->getList($searchCriteria)->getItems();
+
+        /** @var Order|null $order */
+        $order = reset($orders) ?: null;
+
+        return $order;
     }
 
     /**
