@@ -131,6 +131,12 @@
         </arguments>
     </type>
 
+    <type name="Shubo\TbcPayment\Controller\Payment\AbortRedirect">
+        <arguments>
+            <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
+        </arguments>
+    </type>
+
     <!-- Dedicated log file for TBC payment -->
     <virtualType name="ShuboTbcPaymentLogger" type="Magento\Framework\Logger\Monolog">
         <arguments>
