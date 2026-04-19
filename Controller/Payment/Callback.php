@@ -18,6 +18,7 @@ use Magento\Framework\Api\SearchCriteriaBuilder;
 use Psr\Log\LoggerInterface;
 use Magento\Framework\App\ResourceConnection;
 use Shubo\TbcPayment\Gateway\Config\Config;
+use Shubo\TbcPayment\Gateway\Response\PaymentInfoKeys;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
 use Shubo\TbcPayment\Service\SettlementService;
 
@@ -145,19 +146,7 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
         $payment->setAdditionalInformation('flitt_order_id', $callbackData['order_id'] ?? '');
 
         // Store callback data in payment additional info
-        $infoKeys = [
-            'payment_id', 'order_status', 'masked_card', 'rrn',
-            'approval_code', 'tran_type', 'sender_email',
-            'card_type', 'card_bin', 'eci', 'fee',
-            'response_code', 'response_description',
-            'actual_amount', 'actual_currency',
-        ];
-
-        foreach ($infoKeys as $key) {
-            if (!empty($callbackData[$key])) {
-                $payment->setAdditionalInformation($key, $callbackData[$key]);
-            }
-        }
+        PaymentInfoKeys::apply($payment, $callbackData);
 
         if (isset($callbackData['payment_id'])) {
             $payment->setTransactionId((string) $callbackData['payment_id']);
@@ -221,7 +210,7 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
             $paymentId = (string) ($callbackData['payment_id'] ?? '');
             if ($paymentId !== '') {
                 $payment->setTransactionId($paymentId);
-                }
+            }
 
             $payment->setIsTransactionPending(false);
             $payment->setIsTransactionClosed(false);

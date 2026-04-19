@@ -16,6 +16,7 @@ use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
+use Shubo\TbcPayment\Gateway\Response\PaymentInfoKeys;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
 use Shubo\TbcPayment\Model\Ui\ConfigProvider;
 use Shubo\TbcPayment\Service\SettlementService;
@@ -332,18 +333,6 @@ class PendingOrderReconciler
      */
     private function storePaymentInfo(Payment $payment, array $responseData): void
     {
-        $infoKeys = [
-            'payment_id', 'order_status', 'masked_card', 'rrn',
-            'approval_code', 'tran_type', 'sender_email',
-            'card_type', 'card_bin', 'eci', 'fee',
-            'response_code', 'response_description',
-            'actual_amount', 'actual_currency',
-        ];
-
-        foreach ($infoKeys as $key) {
-            if (!empty($responseData[$key])) {
-                $payment->setAdditionalInformation($key, $responseData[$key]);
-            }
-        }
+        PaymentInfoKeys::apply($payment, $responseData);
     }
 }

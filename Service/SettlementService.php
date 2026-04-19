@@ -105,9 +105,21 @@ class SettlementService
             return false;
         }
 
+        // BUG-7: each attempt against Flitt must use a distinct settlement
+        // order_id. On HTTP timeout the first request may have actually
+        // reached Flitt — a retry with the same order_id then returns
+        // error 1013/2004 ("duplicate order_id") and the merchant payout
+        // stays stuck. The attempt counter is persisted on the Magento
+        // payment so retries across processes / containers stay coherent.
+        $attempt = (int) $payment->getAdditionalInformation('settlement_attempt') + 1;
+        $payment->setAdditionalInformation('settlement_attempt', $attempt);
+        $settlementOrderId = $attempt === 1
+            ? 'settlement_' . $flittOrderId
+            : sprintf('settlement_%s_r%d', $flittOrderId, $attempt);
+
         $orderData = [
             'order_type' => 'settlement',
-            'order_id' => 'settlement_' . $flittOrderId,
+            'order_id' => $settlementOrderId,
             'operation_id' => $flittOrderId,
             'merchant_id' => (int) $merchantId,
             'amount' => $totalAmount,

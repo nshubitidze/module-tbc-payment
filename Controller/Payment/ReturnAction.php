@@ -21,6 +21,7 @@ use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
+use Shubo\TbcPayment\Gateway\Response\PaymentInfoKeys;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
 use Shubo\TbcPayment\Service\SettlementService;
 
@@ -141,12 +142,17 @@ class ReturnAction implements HttpGetActionInterface, CsrfAwareActionInterface
             }
 
             if ($flittStatus === 'processing' || $flittStatus === 'created') {
-                // Payment still in progress — show success page, callback/cron will finalize
-                $this->setCheckoutSessionData($order);
+                // Payment still in progress — do NOT redirect to the success
+                // page (misleading if the bank ultimately declines).
+                // Callback + PendingOrderReconciler will finalise asynchronously
+                // and email the customer on success.
                 $this->messageManager->addNoticeMessage(
-                    (string) __('Your payment is being processed. You will receive confirmation shortly.')
+                    (string) __(
+                        'Your payment is still being processed by the bank.'
+                        . ' You will receive an email confirmation shortly.'
+                    )
                 );
-                return $redirect->setPath('checkout/onepage/success');
+                return $redirect->setPath('checkout');
             }
 
             // Declined, expired, reversed, or unknown
@@ -389,18 +395,7 @@ class ReturnAction implements HttpGetActionInterface, CsrfAwareActionInterface
      */
     private function storePaymentDetails(Payment $payment, array $responseData): void
     {
-        $infoKeys = [
-            'payment_id', 'order_status', 'masked_card', 'rrn',
-            'approval_code', 'tran_type', 'card_type', 'card_bin',
-            'eci', 'fee', 'actual_amount', 'actual_currency',
-        ];
-
-        foreach ($infoKeys as $key) {
-            if (!empty($responseData[$key])) {
-                $payment->setAdditionalInformation($key, $responseData[$key]);
-            }
-        }
-
+        PaymentInfoKeys::apply($payment, $responseData);
         $payment->setAdditionalInformation('awaiting_flitt_confirmation', false);
     }
 

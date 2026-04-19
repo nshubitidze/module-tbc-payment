@@ -7,9 +7,12 @@ namespace Shubo\TbcPayment\Controller\Adminhtml\Order;
 use Magento\Backend\App\Action;
 use Magento\Backend\App\Action\Context;
 use Magento\Framework\Controller\ResultInterface;
+use Magento\Framework\Exception\LocalizedException;
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
+use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
+use Shubo\TbcPayment\Model\Ui\ConfigProvider;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -45,6 +48,11 @@ class Settle extends Action
         try {
             /** @var Order $order */
             $order = $this->orderRepository->get($orderId);
+            /** @var Payment|null $payment */
+            $payment = $order->getPayment();
+            if ($payment === null || $payment->getMethod() !== ConfigProvider::CODE) {
+                throw new LocalizedException(__('Invalid payment method for this action.'));
+            }
             $result = $this->settlementService->settle($order, manual: true);
             $this->orderRepository->save($order);
 

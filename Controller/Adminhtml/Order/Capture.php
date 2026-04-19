@@ -7,12 +7,14 @@ namespace Shubo\TbcPayment\Controller\Adminhtml\Order;
 use Magento\Backend\App\Action;
 use Magento\Backend\App\Action\Context;
 use Magento\Framework\Controller\ResultInterface;
+use Magento\Framework\Exception\LocalizedException;
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\CaptureClient;
+use Shubo\TbcPayment\Model\Ui\ConfigProvider;
 
 /**
  * Admin controller to manually capture a pre-authorized TBC payment.
@@ -39,8 +41,11 @@ class Capture extends Action
         try {
             /** @var Order $order */
             $order = $this->orderRepository->get($orderId);
-            /** @var Payment $payment */
+            /** @var Payment|null $payment */
             $payment = $order->getPayment();
+            if ($payment === null || $payment->getMethod() !== ConfigProvider::CODE) {
+                throw new LocalizedException(__('Invalid payment method for this action.'));
+            }
             $storeId = (int) $order->getStoreId();
 
             $flittOrderId = (string) $payment->getAdditionalInformation('flitt_order_id');

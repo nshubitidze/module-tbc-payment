@@ -7,13 +7,16 @@ namespace Shubo\TbcPayment\Controller\Adminhtml\Order;
 use Magento\Backend\App\Action;
 use Magento\Backend\App\Action\Context;
 use Magento\Framework\Controller\ResultInterface;
+use Magento\Framework\Exception\LocalizedException;
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
+use Shubo\TbcPayment\Gateway\Response\PaymentInfoKeys;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
+use Shubo\TbcPayment\Model\Ui\ConfigProvider;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -46,8 +49,11 @@ class CheckStatus extends Action
         try {
             /** @var Order $order */
             $order = $this->orderRepository->get($orderId);
-            /** @var Payment $payment */
+            /** @var Payment|null $payment */
             $payment = $order->getPayment();
+            if ($payment === null || $payment->getMethod() !== ConfigProvider::CODE) {
+                throw new LocalizedException(__('Invalid payment method for this action.'));
+            }
             $flittOrderId = (string) $payment->getAdditionalInformation('flitt_order_id');
 
             if ($flittOrderId === '') {
@@ -128,16 +134,7 @@ class CheckStatus extends Action
     private function processApproval(Order $order, Payment $payment, array $responseData, int $storeId): void
     {
         // Store callback-equivalent data
-        $infoKeys = [
-            'payment_id', 'order_status', 'masked_card', 'rrn',
-            'approval_code', 'tran_type', 'card_type', 'card_bin',
-            'eci', 'actual_amount', 'actual_currency',
-        ];
-        foreach ($infoKeys as $key) {
-            if (!empty($responseData[$key])) {
-                $payment->setAdditionalInformation($key, $responseData[$key]);
-            }
-        }
+        PaymentInfoKeys::apply($payment, $responseData);
 
         $payment->setAdditionalInformation('awaiting_flitt_confirmation', false);
 

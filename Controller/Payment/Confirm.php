@@ -17,6 +17,7 @@ use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
+use Shubo\TbcPayment\Gateway\Response\PaymentInfoKeys;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
 use Shubo\TbcPayment\Service\SettlementService;
 
@@ -229,16 +230,7 @@ class Confirm implements HttpPostActionInterface
      */
     private function processApproval(Order $order, Payment $payment, array $responseData, int $storeId): void
     {
-        $infoKeys = [
-            'payment_id', 'order_status', 'masked_card', 'rrn',
-            'approval_code', 'tran_type', 'card_type', 'card_bin',
-            'eci', 'fee', 'actual_amount', 'actual_currency',
-        ];
-        foreach ($infoKeys as $key) {
-            if (!empty($responseData[$key])) {
-                $payment->setAdditionalInformation($key, $responseData[$key]);
-            }
-        }
+        PaymentInfoKeys::apply($payment, $responseData);
 
         $payment->setAdditionalInformation('flitt_order_id', $responseData['order_id'] ?? '');
         $payment->setAdditionalInformation('awaiting_flitt_confirmation', false);
