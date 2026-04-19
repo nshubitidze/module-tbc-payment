@@ -279,17 +279,93 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
     /**
      * Handle reversed (refunded) payment.
      *
+     * Flitt fires `order_status=reversed` for two distinct business events:
+     *   (a) a pre-authorization was released without ever being captured;
+     *   (b) a previously captured payment is being refunded.
+     *
+     * The handler therefore runs a pure state machine over the current order
+     * state and the reversal amount (integer minor units, per CLAUDE.md #6):
+     *
+     *   closed | canceled                                  -> no-op (idempotent)
+     *   pending_payment | payment_review | new | holded    -> cancel()
+     *   processing | complete + full amount                -> close
+     *   processing | complete + partial amount             -> comment only
+     *   unknown state                                      -> log warning
+     *
      * @param Order $order
      * @param array<string, mixed> $callbackData
      */
     private function handleReversed(Order $order, array $callbackData): void
     {
-        if ($order->getState() === Order::STATE_CLOSED) {
+        $state = (string) $order->getState();
+
+        // (a) Idempotent terminal states: safe to re-deliver without side effects.
+        if ($state === Order::STATE_CLOSED || $state === Order::STATE_CANCELED) {
             return;
         }
 
-        $order->addCommentToStatusHistory(
-            (string) __('Payment reversed by TBC Bank. Transaction ID: %1', $callbackData['payment_id'] ?? 'N/A')
+        $transactionId = (string) ($callbackData['payment_id'] ?? 'N/A');
+
+        // Integer-only amount math — never compare floats on money.
+        $grandTotalMinor = (int) round(((float) $order->getGrandTotal()) * 100);
+        $reverseAmount = (int) ($callbackData['reverse_amount'] ?? 0);
+        if ($reverseAmount <= 0) {
+            $reverseAmount = (int) ($callbackData['amount'] ?? $grandTotalMinor);
+        }
+        $isFullReversal = $reverseAmount >= $grandTotalMinor;
+
+        // (b) Pre-capture states: no invoice yet, run Magento's item-level cancel.
+        $preCaptureStates = [
+            Order::STATE_PENDING_PAYMENT,
+            Order::STATE_PAYMENT_REVIEW,
+            Order::STATE_NEW,
+            Order::STATE_HOLDED,
+        ];
+        if (in_array($state, $preCaptureStates, true)) {
+            $order->cancel();
+            $order->addCommentToStatusHistory(
+                (string) __(
+                    'Payment reversed by TBC Bank before capture. Transaction ID: %1. Order cancelled.',
+                    $transactionId
+                )
+            );
+            return;
+        }
+
+        // (c) Post-capture states: full reversal closes, partial leaves state.
+        if ($state === Order::STATE_PROCESSING || $state === Order::STATE_COMPLETE) {
+            if ($isFullReversal) {
+                $order->setState(Order::STATE_CLOSED)->setStatus(Order::STATE_CLOSED);
+                $order->addCommentToStatusHistory(
+                    (string) __(
+                        'Payment fully reversed by TBC Bank. Transaction ID: %1. Order closed.',
+                        $transactionId
+                    )
+                );
+                return;
+            }
+
+            $amountDisplay = number_format($reverseAmount / 100, 2, '.', '');
+            $currency = (string) $order->getOrderCurrencyCode();
+            $order->addCommentToStatusHistory(
+                (string) __(
+                    'Partial reversal by TBC Bank. Transaction ID: %1. Amount: %2 %3. Order state unchanged.',
+                    $transactionId,
+                    $amountDisplay,
+                    $currency
+                )
+            );
+            return;
+        }
+
+        // (d) Unexpected state — log, do not add a comment (avoid noisy history).
+        $this->logger->warning(
+            'Flitt callback: unexpected reversal on state ' . $state,
+            [
+                'order_id' => $order->getIncrementId(),
+                'state' => $state,
+                'transaction_id' => $transactionId,
+            ]
         );
     }
 
