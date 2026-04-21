@@ -206,4 +206,43 @@
             <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
         </arguments>
     </type>
+
+    <!-- Prod cutover CLI (GO_LIVE_CHECKLIST §3.1). Logger writes to a
+         dedicated payment-cutover.log so the before/after snapshots are
+         easy to audit on launch day and survive log rotation of the
+         per-module files. -->
+    <virtualType name="ShuboPaymentCutoverLogHandler" type="Magento\Framework\Logger\Handler\Base">
+        <arguments>
+            <argument name="fileName" xsi:type="string">/var/log/payment-cutover.log</argument>
+        </arguments>
+    </virtualType>
+
+    <virtualType name="ShuboPaymentCutoverLogger" type="Magento\Framework\Logger\Monolog">
+        <arguments>
+            <argument name="name" xsi:type="string">shubo_payment_cutover</argument>
+            <argument name="handlers" xsi:type="array">
+                <item name="system" xsi:type="object">ShuboPaymentCutoverLogHandler</item>
+            </argument>
+        </arguments>
+    </virtualType>
+
+    <type name="Shubo\TbcPayment\Console\Command\SwitchToProdCommand">
+        <arguments>
+            <argument name="cutoverLogger" xsi:type="object">ShuboPaymentCutoverLogger</argument>
+        </arguments>
+    </type>
+
+    <!-- Bind CLI commands on the INTERFACE, never the concrete CommandList
+         class. See KNOWN_ISSUES BUG-SETUP-1 Symptom 2 — binding on the
+         concrete class forces Magento to eagerly resolve every command
+         during CLI bootstrap, which breaks `setup:install` on cold DBs
+         because Console commands touch Store/Website resolution. -->
+    <type name="Magento\Framework\Console\CommandListInterface">
+        <arguments>
+            <argument name="commands" xsi:type="array">
+                <item name="shubo_payment_switch_to_prod_tbc"
+                      xsi:type="object">Shubo\TbcPayment\Console\Command\SwitchToProdCommand</item>
+            </argument>
+        </arguments>
+    </type>
 </config>
