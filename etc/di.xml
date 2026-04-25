@@ -84,6 +84,12 @@
             <argument name="transferFactory" xsi:type="object">Shubo\TbcPayment\Gateway\Http\TransferFactory</argument>
             <argument name="client" xsi:type="object">Shubo\TbcPayment\Gateway\Http\Client\RefundClient</argument>
             <argument name="handler" xsi:type="object">Shubo\TbcPayment\Gateway\Response\RefundHandler</argument>
+            <!-- Session 3 Priority 1.1.6 Change B: wire ResponseValidator so the
+                 refund command conforms to Magento's gateway validation contract
+                 (matches ShuboTbcInitializeCommand). ResponseValidator checks
+                 response_status === 'success'; RefundHandler still throws on
+                 failure with the friendly UserFacingErrorMapper message. -->
+            <argument name="validator" xsi:type="object">Shubo\TbcPayment\Gateway\Validator\ResponseValidator</argument>
         </arguments>
     </virtualType>
 
@@ -102,6 +108,12 @@
     </type>
 
     <type name="Shubo\TbcPayment\Gateway\Http\Client\RefundClient">
+        <arguments>
+            <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
+        </arguments>
+    </type>
+
+    <type name="Shubo\TbcPayment\Gateway\Response\RefundHandler">
         <arguments>
             <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
         </arguments>

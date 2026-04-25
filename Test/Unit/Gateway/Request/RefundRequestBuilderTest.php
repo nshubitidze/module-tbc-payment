@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Shubo\TbcPayment\Test\Unit\Gateway\Request;
 
+use Magento\Framework\Exception\LocalizedException;
 use Magento\Payment\Gateway\Data\OrderAdapterInterface;
 use Magento\Payment\Gateway\Data\PaymentDataObjectInterface;
 use Magento\Sales\Model\Order\Payment;
@@ -95,7 +96,14 @@ class RefundRequestBuilderTest extends TestCase
         self::assertSame($expected, $providedSig, 'Signature must match Flitt v1.0 spec');
     }
 
-    public function testFallsBackToIncrementIdWhenNoFlittOrderIdStored(): void
+    /**
+     * Session 3 Priority 1.1.6 Change C — missing flitt_order_id must NOT
+     * fall back to the bare increment_id; that guaranteed a Flitt-side
+     * rejection (1013/1002) for orders placed before the redirect-flow
+     * persistence fix (commit 4b8d444). Throw an actionable
+     * LocalizedException instead so the admin can switch to Offline refund.
+     */
+    public function testThrowsWhenFlittOrderIdMissing(): void
     {
         $subject = $this->prepareSubject(
             grandTotal: 25.00,
@@ -103,9 +111,23 @@ class RefundRequestBuilderTest extends TestCase
             storedFlittOrderId: null,
         );
 
-        $params = $this->builder->build($subject);
+        $this->expectException(LocalizedException::class);
+        $this->expectExceptionMessageMatches('/missing the Flitt reference/');
 
-        self::assertSame('000000042', $params['order_id']);
+        $this->builder->build($subject);
+    }
+
+    public function testThrowsWhenFlittOrderIdIsEmptyString(): void
+    {
+        $subject = $this->prepareSubject(
+            grandTotal: 25.00,
+            settledReceivers: null,
+            storedFlittOrderId: '',
+        );
+
+        $this->expectException(LocalizedException::class);
+
+        $this->builder->build($subject);
     }
 
     public function testAmountConvertedToMinorUnits(): void

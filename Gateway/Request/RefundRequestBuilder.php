@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Shubo\TbcPayment\Gateway\Request;
 
+use Magento\Framework\Exception\LocalizedException;
 use Magento\Payment\Gateway\Request\BuilderInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Helper\SubjectReader;
@@ -45,13 +46,26 @@ class RefundRequestBuilder implements BuilderInterface
         $password = $this->config->getPassword($storeId);
         $currency = $order->getCurrencyCode();
 
-        // Use the Flitt order_id stored during callback, fall back to increment_id.
-        $flittOrderId = $payment->getAdditionalInformation('flitt_order_id')
-            ?: $order->getOrderIncrementId();
+        // Session 3 Priority 1.1.6 Change C — no silent fallback to increment_id.
+        //
+        // Rationale: redirect-flow orders placed before commit 4b8d444 persisted
+        // no `flitt_order_id` on the payment. The previous fallback sent a bare
+        // "{increment_id}" to Flitt's /api/reverse, but the real Flitt-side
+        // order_id is `duka_{increment_id}_{timestamp}` — the request was
+        // guaranteed to fail with code 1013 or 1002. Surface an actionable
+        // LocalizedException instead so admin knows to issue an Offline refund
+        // and reconcile manually.
+        $flittOrderId = (string) $payment->getAdditionalInformation('flitt_order_id');
+        if ($flittOrderId === '') {
+            throw new LocalizedException(__(
+                'This order is missing the Flitt reference and cannot be refunded online. '
+                . 'Issue an Offline refund and reconcile with TBC Bank using the payment id from the invoice.'
+            ));
+        }
 
         // v1.0-safe payload: ONLY scalar values. Do not inline receiver arrays here.
         $params = [
-            'order_id' => (string) $flittOrderId,
+            'order_id' => $flittOrderId,
             'merchant_id' => (string) $merchantId,
             'amount' => (string) $amount,
             'currency' => (string) $currency,
