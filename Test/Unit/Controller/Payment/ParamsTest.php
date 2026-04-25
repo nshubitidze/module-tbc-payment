@@ -20,6 +20,7 @@ use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Controller\Payment\Params;
 use Shubo\TbcPayment\Gateway\Config\Config;
+use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
 
 /**
  * Regression tests for BUG-1: Params controller must enforce a CURL timeout
@@ -38,6 +39,7 @@ class ParamsTest extends TestCase
     private ResolverInterface&MockObject $localeResolver;
     private Curl&MockObject $curl;
     private JsonResult&MockObject $jsonResult;
+    private UserFacingErrorMapper&MockObject $userFacingErrorMapper;
 
     protected function setUp(): void
     {
@@ -52,6 +54,7 @@ class ParamsTest extends TestCase
         $this->localeResolver = $this->createMock(ResolverInterface::class);
         $this->curl = $this->createMock(Curl::class);
         $this->jsonResult = $this->createMock(JsonResult::class);
+        $this->userFacingErrorMapper = $this->createMock(UserFacingErrorMapper::class);
 
         $this->jsonFactory->method('create')->willReturn($this->jsonResult);
         $this->jsonResult->method('setData')->willReturnSelf();
@@ -125,6 +128,7 @@ class ParamsTest extends TestCase
             curlFactory: $this->curlFactory,
             json: $this->json,
             localeResolver: $this->localeResolver,
+            userFacingErrorMapper: $this->userFacingErrorMapper,
         );
     }
 

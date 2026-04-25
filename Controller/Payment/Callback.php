@@ -18,6 +18,7 @@ use Magento\Framework\Api\SearchCriteriaBuilder;
 use Psr\Log\LoggerInterface;
 use Magento\Framework\App\ResourceConnection;
 use Shubo\TbcPayment\Gateway\Config\Config;
+use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
 use Shubo\TbcPayment\Gateway\Response\PaymentInfoKeys;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
 use Shubo\TbcPayment\Service\SettlementService;
@@ -41,6 +42,7 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
         private readonly Config $config,
         private readonly LoggerInterface $logger,
         private readonly ResourceConnection $resourceConnection,
+        private readonly UserFacingErrorMapper $userFacingErrorMapper,
     ) {
     }
 
@@ -246,6 +248,12 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
     /**
      * Handle declined payment.
      *
+     * The raw Flitt `error_message` was previously leaked verbatim into the
+     * order-history comment, which is customer-visible via "My Orders". We now
+     * log the raw triple at ERROR and translate the decline through
+     * {@see UserFacingErrorMapper} so the customer sees a localized,
+     * actionable message instead of e.g. "Application error".
+     *
      * @param Order $order
      * @param array<string, mixed> $callbackData
      */
@@ -255,9 +263,27 @@ class Callback implements HttpPostActionInterface, CsrfAwareActionInterface
             return;
         }
 
+        $rawErrorCode = $callbackData['error_code'] ?? 0;
+        $rawErrorMessage = (string) ($callbackData['error_message'] ?? '');
+        $requestId = isset($callbackData['request_id'])
+            ? (string) $callbackData['request_id']
+            : null;
+
+        $this->logger->error('TBC Flitt error mapped to user copy', [
+            'context'       => 'callback.handleDeclined',
+            'error_code'    => $rawErrorCode,
+            'error_message' => $rawErrorMessage,
+            'request_id'    => $requestId,
+            'order_id'      => $order->getIncrementId(),
+        ]);
+
+        $friendly = $this->userFacingErrorMapper
+            ->toLocalizedException($rawErrorCode, $rawErrorMessage, $requestId)
+            ->getMessage();
+
         $order->cancel();
         $order->addCommentToStatusHistory(
-            (string) __('Payment declined by TBC Bank. Reason: %1', $callbackData['error_message'] ?? 'N/A')
+            (string) __('Payment declined by TBC Bank. Reason: %1', $friendly)
         );
     }
 

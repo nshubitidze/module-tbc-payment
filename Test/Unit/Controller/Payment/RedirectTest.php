@@ -21,6 +21,7 @@ use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Controller\Payment\Redirect;
 use Shubo\TbcPayment\Gateway\Config\Config;
+use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
 
 /**
  * Regression tests for BUG-2: Redirect controller must enforce a CURL timeout
@@ -41,6 +42,7 @@ class RedirectTest extends TestCase
     private Curl&MockObject $curl;
     private JsonResult&MockObject $jsonResult;
     private OrderPaymentRepositoryInterface&MockObject $paymentRepository;
+    private UserFacingErrorMapper&MockObject $userFacingErrorMapper;
 
     protected function setUp(): void
     {
@@ -56,6 +58,7 @@ class RedirectTest extends TestCase
         $this->curl = $this->createMock(Curl::class);
         $this->jsonResult = $this->createMock(JsonResult::class);
         $this->paymentRepository = $this->createMock(OrderPaymentRepositoryInterface::class);
+        $this->userFacingErrorMapper = $this->createMock(UserFacingErrorMapper::class);
 
         $this->jsonFactory->method('create')->willReturn($this->jsonResult);
         $this->jsonResult->method('setData')->willReturnSelf();
@@ -104,6 +107,7 @@ class RedirectTest extends TestCase
             json: $this->json,
             localeResolver: $this->localeResolver,
             paymentRepository: $this->paymentRepository,
+            userFacingErrorMapper: $this->userFacingErrorMapper,
         );
         $controller->execute();
 
@@ -166,6 +170,7 @@ class RedirectTest extends TestCase
             json: $this->json,
             localeResolver: $this->localeResolver,
             paymentRepository: $this->paymentRepository,
+            userFacingErrorMapper: $this->userFacingErrorMapper,
         );
         $controller->execute();
 
@@ -216,6 +221,7 @@ class RedirectTest extends TestCase
             json: $this->json,
             localeResolver: $this->localeResolver,
             paymentRepository: $this->paymentRepository,
+            userFacingErrorMapper: $this->userFacingErrorMapper,
         );
         $controller->execute();
     }

@@ -18,6 +18,7 @@ use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
+use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
 
 /**
  * Creates a Flitt payment order for redirect checkout mode.
@@ -41,6 +42,7 @@ class Redirect implements HttpPostActionInterface
         private readonly Json $json,
         private readonly ResolverInterface $localeResolver,
         private readonly OrderPaymentRepositoryInterface $paymentRepository,
+        private readonly UserFacingErrorMapper $userFacingErrorMapper,
     ) {
     }
 
@@ -206,14 +208,28 @@ class Redirect implements HttpPostActionInterface
         $checkoutUrl = $response['checkout_url'] ?? '';
 
         if ($status !== 'success' || $checkoutUrl === '') {
-            $errorMessage = $response['error_message'] ?? __('Unknown error from Flitt API.');
-            $this->logger->error('TBC redirect API error', [
+            // Log the raw Flitt triple BEFORE mapping so ops / support can
+            // correlate the friendly user message back to the Flitt side
+            // via request_id. The mapper itself is a pure function and does
+            // no logging — contract is documented in error-code-map.md §3.
+            $rawErrorCode = $response['error_code'] ?? 0;
+            $rawErrorMessage = (string) ($response['error_message'] ?? '');
+            $requestId = isset($response['request_id'])
+                ? (string) $response['request_id']
+                : null;
+
+            $this->logger->error('TBC Flitt error mapped to user copy', [
+                'context'         => 'redirect.checkout_url',
+                'error_code'      => $rawErrorCode,
+                'error_message'   => $rawErrorMessage,
+                'request_id'      => $requestId,
                 'response_status' => $status,
-                'error_message'   => $errorMessage,
             ]);
 
-            throw new LocalizedException(
-                __('Payment gateway error: %1', $errorMessage),
+            throw $this->userFacingErrorMapper->toLocalizedException(
+                $rawErrorCode,
+                $rawErrorMessage,
+                $requestId,
             );
         }
 

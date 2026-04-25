@@ -21,6 +21,7 @@ use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Controller\Payment\Callback;
 use Shubo\TbcPayment\Gateway\Config\Config;
+use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
 use Shubo\TbcPayment\Service\SettlementService;
 
@@ -49,6 +50,7 @@ class CallbackTest extends TestCase
     private ResourceConnection&MockObject $resourceConnection;
     private AdapterInterface&MockObject $connection;
     private JsonResult&MockObject $jsonResult;
+    private UserFacingErrorMapper&MockObject $userFacingErrorMapper;
 
     /** @var list<string> */
     private array $comments = [];
@@ -72,6 +74,7 @@ class CallbackTest extends TestCase
         $this->resourceConnection   = $this->createMock(ResourceConnection::class);
         $this->connection           = $this->createMock(AdapterInterface::class);
         $this->jsonResult           = $this->createMock(JsonResult::class);
+        $this->userFacingErrorMapper = $this->createMock(UserFacingErrorMapper::class);
 
         $this->jsonFactory->method('create')->willReturn($this->jsonResult);
         $this->jsonResult->method('setData')->willReturnSelf();
@@ -378,6 +381,7 @@ class CallbackTest extends TestCase
             $this->config,
             $this->logger,
             $this->resourceConnection,
+            $this->userFacingErrorMapper,
         );
     }
 }

@@ -16,6 +16,7 @@ use Magento\Framework\UrlInterface;
 use Magento\Quote\Api\CartRepositoryInterface;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
+use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
 
 /**
  * AJAX endpoint that obtains a Flitt checkout token for the active quote.
@@ -36,6 +37,7 @@ class Params implements HttpPostActionInterface
         private readonly CurlFactory $curlFactory,
         private readonly Json $json,
         private readonly ResolverInterface $localeResolver,
+        private readonly UserFacingErrorMapper $userFacingErrorMapper,
     ) {
     }
 
@@ -196,14 +198,27 @@ class Params implements HttpPostActionInterface
         $token = $response['token'] ?? '';
 
         if ($status !== 'success' || $token === '') {
-            $errorMessage = $response['error_message'] ?? __('Unknown error from Flitt API.');
-            $this->logger->error('TBC token API error', [
+            // Log the raw Flitt triple BEFORE mapping so ops / support can
+            // correlate the friendly user message back to the Flitt side
+            // via request_id. See docs/error-code-map.md §3 for contract.
+            $rawErrorCode = $response['error_code'] ?? 0;
+            $rawErrorMessage = (string) ($response['error_message'] ?? '');
+            $requestId = isset($response['request_id'])
+                ? (string) $response['request_id']
+                : null;
+
+            $this->logger->error('TBC Flitt error mapped to user copy', [
+                'context'         => 'params.token',
+                'error_code'      => $rawErrorCode,
+                'error_message'   => $rawErrorMessage,
+                'request_id'      => $requestId,
                 'response_status' => $status,
-                'error_message' => $errorMessage,
             ]);
 
-            throw new LocalizedException(
-                __('Payment gateway error: %1', $errorMessage),
+            throw $this->userFacingErrorMapper->toLocalizedException(
+                $rawErrorCode,
+                $rawErrorMessage,
+                $requestId,
             );
         }
 
