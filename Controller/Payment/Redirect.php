@@ -14,6 +14,7 @@ use Magento\Framework\Locale\ResolverInterface;
 use Magento\Framework\Serialize\Serializer\Json;
 use Magento\Framework\UrlInterface;
 use Magento\Sales\Api\OrderPaymentRepositoryInterface;
+use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
@@ -43,12 +44,14 @@ class Redirect implements HttpPostActionInterface
         private readonly ResolverInterface $localeResolver,
         private readonly OrderPaymentRepositoryInterface $paymentRepository,
         private readonly UserFacingErrorMapper $userFacingErrorMapper,
+        private readonly OrderRepositoryInterface $orderRepository,
     ) {
     }
 
     public function execute(): ResultInterface
     {
         $result = $this->jsonFactory->create();
+        $orderForFailureLog = null;
 
         try {
             $order = $this->checkoutSession->getLastRealOrder();
@@ -57,11 +60,40 @@ class Redirect implements HttpPostActionInterface
                 throw new LocalizedException(__('No order found.'));
             }
 
+            // Hold a reference so the catch-all block can attach a history
+            // comment to the order if the Flitt call blows up below.
+            $orderForFailureLog = $order;
+
             if ($order->getState() !== Order::STATE_PENDING_PAYMENT) {
                 throw new LocalizedException(__('Order is not in pending payment state.'));
             }
 
             $storeId = (int) $order->getStoreId();
+
+            // Edge-cases-matrix §5: idempotency short-circuit for double-clicked
+            // Place Order. If a prior invocation already persisted a
+            // flitt_order_id + checkout_url for this same order, and the
+            // order's created_at is still within the Flitt payment_lifetime
+            // window, return the cached URL without calling Flitt again. This
+            // prevents a second click from overwriting the first flitt_order_id
+            // (which would orphan any callback Flitt sends for the first token).
+            $cachedUrl = $this->cachedCheckoutUrlFor($order, $storeId);
+            if ($cachedUrl !== null) {
+                /** @var Payment $existingPayment */
+                $existingPayment = $order->getPayment();
+                $this->logger->info(
+                    'TBC redirect: returning cached checkout URL for order_id='
+                    . (string) $order->getIncrementId()
+                    . ', flitt_order_id='
+                    . (string) $existingPayment->getAdditionalInformation('flitt_order_id'),
+                );
+
+                return $result->setData([
+                    'success'      => true,
+                    'checkout_url' => $cachedUrl,
+                ]);
+            }
+
             $merchantId = $this->config->getMerchantId($storeId);
             $password = $this->config->getPassword($storeId);
             $apiUrl = $this->config->getApiUrl($storeId);
@@ -119,6 +151,11 @@ class Redirect implements HttpPostActionInterface
             }
             $payment->setAdditionalInformation('flitt_order_id', $flittOrderId);
             $payment->setAdditionalInformation('checkout_type', 'redirect');
+            // Persist the checkout_url so that a second POST to /redirect (user
+            // double-clicked Place Order) can short-circuit on the cached URL
+            // instead of minting a fresh flitt_order_id and overwriting ours —
+            // see edge-cases-matrix.md §5 for the full orphan scenario.
+            $payment->setAdditionalInformation('checkout_url', $checkoutUrl);
             // Persist via the payment repository explicitly. `orderRepository->save($order)`
             // does NOT reliably cascade changes to `additional_information` on an
             // order loaded via `checkoutSession->getLastRealOrder()` — observed
@@ -147,11 +184,81 @@ class Redirect implements HttpPostActionInterface
                 'exception' => $e,
             ]);
 
+            // Edge-cases-matrix §4: curl timeout / network failure leaves the
+            // Magento order in pending_payment with a flitt_order_id Flitt has
+            // never seen. Record a visible breadcrumb on the order so admin /
+            // support can correlate the stuck order to the outage; the
+            // reconciler will ultimately cancel it after payment_lifetime.
+            if ($orderForFailureLog !== null) {
+                try {
+                    $orderForFailureLog->addCommentToStatusHistory(
+                        (string) __(
+                            'Flitt token endpoint unreachable; reconciler will retry. '
+                            . 'Admin: investigate Flitt or cancel manually if persistent.'
+                        )
+                    );
+                    $this->orderRepository->save($orderForFailureLog);
+                } catch (\Exception $historyException) {
+                    $this->logger->error(
+                        'TBC Redirect: failed to persist failure history comment: '
+                        . $historyException->getMessage(),
+                        ['exception' => $historyException]
+                    );
+                }
+            }
+
             return $result->setData([
                 'success' => false,
                 'message' => (string) __('Unable to initialize payment. Please try again.'),
             ]);
         }
+    }
+
+    /**
+     * Return the previously-issued Flitt checkout URL if this request is a
+     * duplicate of a successful one, otherwise null so the caller mints a
+     * fresh order_id + token.
+     *
+     * The short-circuit only fires when:
+     *   - flitt_order_id AND checkout_url are both present on the payment,
+     *   - the order is still in pending_payment,
+     *   - the order's created_at is within payment_lifetime seconds.
+     *
+     * Past the lifetime the Flitt session is assumed expired and we
+     * regenerate rather than calling /api/status/order_id in the hot path.
+     */
+    private function cachedCheckoutUrlFor(Order $order, int $storeId): ?string
+    {
+        /** @var Payment|null $payment */
+        $payment = $order->getPayment();
+        if ($payment === null) {
+            return null;
+        }
+
+        $existingFlittOrderId = (string) ($payment->getAdditionalInformation('flitt_order_id') ?? '');
+        $existingCheckoutUrl = (string) ($payment->getAdditionalInformation('checkout_url') ?? '');
+
+        if ($existingFlittOrderId === '' || $existingCheckoutUrl === '') {
+            return null;
+        }
+
+        $createdAt = (string) $order->getCreatedAt();
+        if ($createdAt === '') {
+            return null;
+        }
+
+        try {
+            $createdAtTs = (new \DateTimeImmutable($createdAt))->getTimestamp();
+        } catch (\Exception) {
+            return null;
+        }
+
+        $lifetime = $this->config->getPaymentLifetime($storeId);
+        if ((time() - $createdAtTs) > $lifetime) {
+            return null;
+        }
+
+        return $existingCheckoutUrl;
     }
 
     /**

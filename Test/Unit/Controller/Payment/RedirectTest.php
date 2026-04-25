@@ -97,18 +97,7 @@ class RedirectTest extends TestCase
                 $callOrder[] = ['post'];
             });
 
-        $controller = new Redirect(
-            jsonFactory: $this->jsonFactory,
-            checkoutSession: $this->checkoutSession,
-            config: $this->config,
-            urlBuilder: $this->urlBuilder,
-            logger: $this->logger,
-            curlFactory: $this->curlFactory,
-            json: $this->json,
-            localeResolver: $this->localeResolver,
-            paymentRepository: $this->paymentRepository,
-            userFacingErrorMapper: $this->userFacingErrorMapper,
-        );
+        $controller = $this->makeController();
         $controller->execute();
 
         self::assertArrayHasKey(CURLOPT_TIMEOUT, $optionsApplied);
@@ -160,18 +149,7 @@ class RedirectTest extends TestCase
                 $postedUrl = $url;
             });
 
-        $controller = new Redirect(
-            jsonFactory: $this->jsonFactory,
-            checkoutSession: $this->checkoutSession,
-            config: $this->config,
-            urlBuilder: $this->urlBuilder,
-            logger: $this->logger,
-            curlFactory: $this->curlFactory,
-            json: $this->json,
-            localeResolver: $this->localeResolver,
-            paymentRepository: $this->paymentRepository,
-            userFacingErrorMapper: $this->userFacingErrorMapper,
-        );
+        $controller = $this->makeController();
         $controller->execute();
 
         self::assertSame('https://pay.flitt.com/api/checkout/url', $postedUrl);
@@ -211,24 +189,172 @@ class RedirectTest extends TestCase
                 return is_string($info) && str_starts_with($info, 'duka_000000042_');
             }));
 
-        $controller = new Redirect(
-            jsonFactory: $this->jsonFactory,
-            checkoutSession: $this->checkoutSession,
-            config: $this->config,
-            urlBuilder: $this->urlBuilder,
-            logger: $this->logger,
-            curlFactory: $this->curlFactory,
-            json: $this->json,
-            localeResolver: $this->localeResolver,
-            paymentRepository: $this->paymentRepository,
-            userFacingErrorMapper: $this->userFacingErrorMapper,
-        );
+        $controller = $this->makeController();
         $controller->execute();
     }
 
-    private function primeOrderAndConfig(): void
+    /**
+     * Edge-cases-matrix §5 — double-click Place Order idempotency. If the
+     * first invocation already persisted flitt_order_id + checkout_url and
+     * the order is fresh, a second POST MUST return the cached URL without
+     * calling Flitt again (no curl->post, no curl->setOptions, no fresh
+     * flitt_order_id overwrite).
+     */
+    public function testReturnsCachedUrlOnSecondClickIdempotency(): void
     {
-        $additionalInformation = [];
+        $cachedFlittOrderId = 'duka_000000042_1700000000';
+        $cachedCheckoutUrl = 'https://pay.flitt.com/merchants/abc/default/index.html?token=cached';
+
+        $this->primeOrderAndConfig(
+            preSeededAdditionalInfo: [
+                'flitt_order_id' => $cachedFlittOrderId,
+                'checkout_url'   => $cachedCheckoutUrl,
+                'checkout_type'  => 'redirect',
+            ],
+        );
+
+        // Second click MUST NOT touch Flitt or the payment repository.
+        $this->curl->expects(self::never())->method('post');
+        $this->curl->expects(self::never())->method('setOptions');
+        $this->paymentRepository->expects(self::never())->method('save');
+
+        $captured = null;
+        $this->jsonResult->expects(self::atLeastOnce())
+            ->method('setData')
+            ->willReturnCallback(function (array $data) use (&$captured): JsonResult {
+                $captured = $data;
+                return $this->jsonResult;
+            });
+
+        $controller = $this->makeController();
+        $controller->execute();
+
+        self::assertIsArray($captured);
+        self::assertTrue($captured['success']);
+        self::assertSame($cachedCheckoutUrl, $captured['checkout_url']);
+    }
+
+    /**
+     * Edge-cases-matrix §5 — when the order's created_at is past the
+     * configured payment_lifetime, the Flitt session is assumed expired
+     * and we regenerate rather than returning a stale cached URL.
+     */
+    public function testRegeneratesUrlIfCachePastLifetime(): void
+    {
+        // created_at 2 hours ago, lifetime is 1 hour (config default) →
+        // cache is stale, controller must call Flitt again.
+        $staleCreatedAt = (new \DateTimeImmutable('-2 hours'))->format('Y-m-d H:i:s');
+
+        $this->primeOrderAndConfig(
+            preSeededAdditionalInfo: [
+                'flitt_order_id' => 'duka_000000042_STALE',
+                'checkout_url'   => 'https://pay.flitt.com/stale',
+                'checkout_type'  => 'redirect',
+            ],
+            createdAt: $staleCreatedAt,
+        );
+
+        $this->json->method('serialize')->willReturn('{"request":{}}');
+        $this->json->method('unserialize')->willReturn([
+            'response' => [
+                'response_status' => 'success',
+                'checkout_url'    => 'https://pay.flitt.com/fresh',
+                'payment_id'      => '999',
+            ],
+        ]);
+        $this->curl->method('getStatus')->willReturn(200);
+        $this->curl->method('getBody')->willReturn(
+            '{"response":{"response_status":"success","checkout_url":"https://pay.flitt.com/fresh","payment_id":"999"}}'
+        );
+
+        // Stale path MUST call Flitt once with a fresh flitt_order_id.
+        $this->curl->expects(self::once())->method('post');
+        $this->paymentRepository->expects(self::once())
+            ->method('save')
+            ->with(self::callback(static function ($payment): bool {
+                // The new flitt_order_id must differ from the stale one.
+                $info = (string) $payment->getAdditionalInformation('flitt_order_id');
+                $checkoutUrl = (string) $payment->getAdditionalInformation('checkout_url');
+                return str_starts_with($info, 'duka_000000042_')
+                    && $info !== 'duka_000000042_STALE'
+                    && $checkoutUrl === 'https://pay.flitt.com/fresh';
+            }));
+
+        $captured = null;
+        $this->jsonResult->expects(self::atLeastOnce())
+            ->method('setData')
+            ->willReturnCallback(function (array $data) use (&$captured): JsonResult {
+                $captured = $data;
+                return $this->jsonResult;
+            });
+
+        $controller = $this->makeController();
+        $controller->execute();
+
+        self::assertIsArray($captured);
+        self::assertTrue($captured['success']);
+        self::assertSame('https://pay.flitt.com/fresh', $captured['checkout_url']);
+    }
+
+    /**
+     * Edge-cases-matrix §4 — when the Flitt token endpoint is unreachable
+     * (curl throws) the controller must attach a visible history comment
+     * on the Magento order so admin can correlate the stuck order to the
+     * outage, then save the order via orderRepository.
+     */
+    public function testAddsHistoryCommentOnFlittTimeout(): void
+    {
+        [$order] = $this->primeOrderAndConfig();
+        $this->json->method('serialize')->willReturn('{"request":{}}');
+
+        // Simulate a curl transport failure (e.g. timeout) — the Magento
+        // Curl wrapper throws a generic \Exception in that situation.
+        $this->curl->method('post')
+            ->willThrowException(new \RuntimeException('cURL error 28: Operation timed out'));
+
+        $order->expects(self::once())
+            ->method('addCommentToStatusHistory')
+            ->with(self::callback(static function ($comment): bool {
+                $str = (string) $comment;
+                return str_contains($str, 'Flitt token endpoint unreachable')
+                    && str_contains($str, 'reconciler will retry');
+            }));
+
+        $this->orderRepository->expects(self::once())
+            ->method('save')
+            ->with($order);
+
+        $captured = null;
+        $this->jsonResult->expects(self::atLeastOnce())
+            ->method('setData')
+            ->willReturnCallback(function (array $data) use (&$captured): JsonResult {
+                $captured = $data;
+                return $this->jsonResult;
+            });
+
+        $controller = $this->makeController();
+        $controller->execute();
+
+        self::assertIsArray($captured);
+        self::assertFalse($captured['success']);
+    }
+
+    /**
+     * Primes the shared mocks (checkoutSession, config, urlBuilder) for a
+     * "fresh" order with an empty payment additional_information map and
+     * returns the payment + order so tests can inspect/seed them.
+     *
+     * @param array<string, mixed> $preSeededAdditionalInfo seed additional_information
+     *        before the controller runs (e.g. for idempotency short-circuit tests).
+     * @param string|null $createdAt ISO datetime for $order->getCreatedAt(); null
+     *        means "now" (controller will treat the cache as fresh).
+     * @return array{0: Order&MockObject, 1: Payment&MockObject}
+     */
+    private function primeOrderAndConfig(
+        array $preSeededAdditionalInfo = [],
+        ?string $createdAt = null,
+    ): array {
+        $additionalInformation = $preSeededAdditionalInfo;
         $payment = $this->getMockBuilder(Payment::class)
             ->disableOriginalConstructor()
             ->onlyMethods(['setAdditionalInformation', 'getAdditionalInformation'])
@@ -251,6 +377,7 @@ class RedirectTest extends TestCase
             ->onlyMethods([
                 'getEntityId', 'getState', 'getStoreId', 'getIncrementId',
                 'getPayment', 'getGrandTotal', 'getOrderCurrencyCode', 'getCustomerEmail',
+                'getCreatedAt', 'addCommentToStatusHistory',
             ])
             ->getMock();
         $order->method('getEntityId')->willReturn(11);
@@ -261,6 +388,9 @@ class RedirectTest extends TestCase
         $order->method('getOrderCurrencyCode')->willReturn('GEL');
         $order->method('getCustomerEmail')->willReturn('buyer@example.com');
         $order->method('getPayment')->willReturn($payment);
+        $order->method('getCreatedAt')->willReturn(
+            $createdAt ?? (new \DateTimeImmutable('now'))->format('Y-m-d H:i:s')
+        );
 
         $this->checkoutSession->method('getLastRealOrder')->willReturn($order);
 
@@ -273,5 +403,24 @@ class RedirectTest extends TestCase
 
         $this->urlBuilder->method('getUrl')->willReturn('https://duka.ge/cb');
         $this->localeResolver->method('getLocale')->willReturn('en_US');
+
+        return [$order, $payment];
+    }
+
+    private function makeController(): Redirect
+    {
+        return new Redirect(
+            jsonFactory: $this->jsonFactory,
+            checkoutSession: $this->checkoutSession,
+            config: $this->config,
+            urlBuilder: $this->urlBuilder,
+            logger: $this->logger,
+            curlFactory: $this->curlFactory,
+            json: $this->json,
+            localeResolver: $this->localeResolver,
+            paymentRepository: $this->paymentRepository,
+            userFacingErrorMapper: $this->userFacingErrorMapper,
+            orderRepository: $this->orderRepository,
+        );
     }
 }

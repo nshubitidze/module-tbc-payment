@@ -156,6 +156,18 @@ class PendingOrderReconciler
             return;
         }
 
+        // Edge-cases-matrix §4: Flitt returns HTTP 200 with
+        // `response_status=failure` + `error_code=1011` for order_ids it has
+        // never seen — the classic "token endpoint timed out before Flitt
+        // registered the order" orphan class. Signature validation below
+        // would reject this error envelope (Flitt does not sign failure
+        // payloads the same way), so the not-found branch has to run BEFORE
+        // the signature check.
+        if ($this->isOrderNotFoundResponse($responseData)) {
+            $this->handleOrderNotFound($order, (string) $flittOrderId, $storeId, $responseData);
+            return;
+        }
+
         if (!$this->callbackValidator->validate($responseData, $storeId)) {
             $this->logger->error('TBC reconciler: signature validation failed', [
                 'order_id' => $order->getIncrementId(),
@@ -193,6 +205,106 @@ class PendingOrderReconciler
             $connection->rollBack();
             throw $e;
         }
+    }
+
+    /**
+     * Detect Flitt's "we have never heard of this order" response.
+     *
+     * Flitt returns HTTP 200 with either
+     *   {response_status: "failure", error_code: 1011, ...}
+     * or an effectively empty response status when the order_id wasn't
+     * registered on their side (e.g. because /api/checkout/url timed out on
+     * our side before it actually hit the endpoint).
+     *
+     * @param array<string, mixed> $responseData
+     */
+    private function isOrderNotFoundResponse(array $responseData): bool
+    {
+        $status = (string) ($responseData['response_status'] ?? '');
+        $errorCode = (int) ($responseData['error_code'] ?? 0);
+
+        if ($errorCode === 1011) {
+            return true;
+        }
+
+        // Empty/failure envelope with no order_status field — Flitt has no
+        // record of the order.
+        if ($status === 'failure' && !isset($responseData['order_status'])) {
+            return true;
+        }
+
+        if ($status === '' && !isset($responseData['order_status'])) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Handle a Flitt "order not found" response: if the Magento order is
+     * older than the payment lifetime we cancel it (Flitt will never
+     * register it now), otherwise we leave it alone — Flitt may still be
+     * catching up, and a premature cancel would race a late success.
+     *
+     * @param array<string, mixed> $responseData
+     */
+    private function handleOrderNotFound(
+        Order $order,
+        string $flittOrderId,
+        int $storeId,
+        array $responseData
+    ): void {
+        $createdAt = (string) $order->getCreatedAt();
+        $ageSeconds = null;
+        if ($createdAt !== '') {
+            try {
+                $ageSeconds = time() - (new \DateTimeImmutable($createdAt))->getTimestamp();
+            } catch (\Exception) {
+                $ageSeconds = null;
+            }
+        }
+
+        $lifetime = $this->config->getPaymentLifetime($storeId);
+
+        if ($ageSeconds === null || $ageSeconds <= $lifetime) {
+            $this->logger->info(
+                'TBC reconciler: Flitt reports order not found but order is within lifetime; retry later',
+                [
+                    'order_id'       => $order->getIncrementId(),
+                    'flitt_order_id' => $flittOrderId,
+                    'age_seconds'    => $ageSeconds,
+                    'lifetime'       => $lifetime,
+                    'error_code'     => $responseData['error_code'] ?? null,
+                ]
+            );
+            return;
+        }
+
+        $connection = $this->resourceConnection->getConnection();
+        $connection->beginTransaction();
+        try {
+            $order->cancel();
+            $order->addCommentToStatusHistory(
+                (string) __(
+                    'Flitt never received this order; cancelled by reconciler after '
+                    . 'payment lifetime (%1s) expired. flitt_order_id: %2',
+                    $lifetime,
+                    $flittOrderId
+                )
+            );
+            $this->orderRepository->save($order);
+            $connection->commit();
+        } catch (\Exception $e) {
+            $connection->rollBack();
+            throw $e;
+        }
+
+        $this->logger->warning('TBC reconciler: cancelled orphaned order (Flitt never registered it)', [
+            'order_id'       => $order->getIncrementId(),
+            'flitt_order_id' => $flittOrderId,
+            'age_seconds'    => $ageSeconds,
+            'lifetime'       => $lifetime,
+        ]);
     }
 
     /**
