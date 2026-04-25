@@ -156,6 +156,9 @@ class ConfirmTest extends TestCase
             flittOrderId: 'duka_000000042_1700',
             grandTotal: 10.00,
         );
+        $reloadedOrder->getPayment()
+            ->expects(self::never())
+            ->method('setParentTransactionId');
         $this->primeOrderRepositoryReload($reloadedOrder);
 
         $this->primeRowLockSelect();
@@ -164,6 +167,49 @@ class ConfirmTest extends TestCase
         $this->connection->expects(self::once())->method('commit');
         // Two saves: one inside transaction (order processed), one after settlement.
         $this->orderRepository->expects(self::atLeastOnce())->method('save');
+
+        $this->buildController()->execute();
+
+        self::assertTrue($this->lastResultData['success']);
+    }
+
+    /**
+     * Regression for Session 3 Priority 3.1 — dropping the dangling
+     * parent_transaction_id synthesized from "{increment_id}-auth".
+     *
+     * Assert that the preauth branch also never calls setParentTransactionId.
+     */
+    public function testPreauthBranchDoesNotSetParentTransactionId(): void
+    {
+        $sessionOrder = $this->makeOrderMock(
+            state: Order::STATE_PENDING_PAYMENT,
+            flittOrderId: 'duka_000000042_1700',
+        );
+        $this->checkoutSession->method('getLastRealOrder')->willReturn($sessionOrder);
+
+        $this->statusClient->method('checkStatus')->willReturn(['response' => [
+            'order_status' => 'approved',
+            'order_id' => 'duka_000000042_1700',
+            'payment_id' => 'pay-1',
+            'amount' => 1000,
+        ]]);
+        $this->callbackValidator->method('validate')->willReturn(true);
+        $this->config->method('isPreauth')->willReturn(true);
+
+        $reloadedOrder = $this->makeOrderMock(
+            state: Order::STATE_PENDING_PAYMENT,
+            flittOrderId: 'duka_000000042_1700',
+            grandTotal: 10.00,
+        );
+        $reloadedOrder->getPayment()
+            ->expects(self::never())
+            ->method('setParentTransactionId');
+        $this->primeOrderRepositoryReload($reloadedOrder);
+
+        $this->primeRowLockSelect();
+
+        $this->connection->expects(self::once())->method('beginTransaction');
+        $this->connection->expects(self::once())->method('commit');
 
         $this->buildController()->execute();
 

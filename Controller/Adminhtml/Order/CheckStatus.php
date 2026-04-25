@@ -140,8 +140,13 @@ class CheckStatus extends Action
 
         $paymentId = (string) ($responseData['payment_id'] ?? '');
         if ($paymentId !== '') {
+            // NOTE: We intentionally do NOT call setParentTransactionId() here.
+            // In direct-sale (non-preauth) mode there is no auth transaction upstream
+            // that the capture could point at, and inventing a synthetic
+            // "{increment_id}-auth" parent_txn_id produced dangling parent links in the
+            // admin transaction tree. When preauth capture is implemented as a
+            // distinct workflow, reintroduce the parent pointer from a REAL auth row.
             $payment->setTransactionId($paymentId);
-            $payment->setParentTransactionId($order->getIncrementId() . '-auth');
         }
 
         if ($this->config->isPreauth($storeId)) {
