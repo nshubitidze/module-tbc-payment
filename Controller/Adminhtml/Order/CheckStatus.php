@@ -114,12 +114,36 @@ class CheckStatus extends Action
                     (string) __('Payment %1. Order has been cancelled.', $flittStatus)
                 );
             }
-        } catch (\Exception $e) {
+        } catch (LocalizedException $e) {
+            // LocalizedException messages are explicitly authored for user
+            // surfaces (every `__()` string in this module passes review).
+            // Surface them as-is so guard messages ("Invalid payment method
+            // for this action.") still reach the admin verbatim.
             $this->logger->error('Status check failed', [
                 'order_id' => $orderId,
                 'error' => $e->getMessage(),
             ]);
-            $this->messageManager->addErrorMessage((string) __('Status check failed: %1', $e->getMessage()));
+            $this->messageManager->addErrorMessage((string) $e->getMessage());
+        } catch (\Exception $e) {
+            // Session 3 Pass 4 (reviewer-signoff §S-4 / architect-scope §2.2.4):
+            // never surface raw \Exception text to the admin UI. The
+            // controller is admin-only, so the leak is contained, but the
+            // same "no raw triples to user copy" principle that drives
+            // UserFacingErrorMapper applies here. The bland-but-no-leak
+            // option is chosen because FlittApiException (a subclass of
+            // LocalizedException — caught above) is the only structured
+            // failure on this path; arbitrary \Exception leaks ($e->getMessage()
+            // could be a stack-trace-style RuntimeException) are now
+            // suppressed. When FlittApiException carries an error_code we
+            // can route it through UserFacingErrorMapper for friendlier
+            // copy than the bland default.
+            $this->logger->error('Status check failed', [
+                'order_id' => $orderId,
+                'error' => $e->getMessage(),
+            ]);
+            $this->messageManager->addErrorMessage(
+                (string) __('Status check failed. See shubo_tbc_payment.log for details.')
+            );
         }
 
         return $resultRedirect->setPath('sales/order/view', ['order_id' => $orderId]);

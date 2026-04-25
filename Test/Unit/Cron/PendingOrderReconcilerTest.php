@@ -156,6 +156,76 @@ class PendingOrderReconcilerTest extends TestCase
         $this->adapter->expects(self::never())->method('beginTransaction');
         $this->adapter->expects(self::never())->method('commit');
 
+        // Session 3 Priority 3.1 regression guard — the not-found branch
+        // never reaches handleApproved, so the dropped setter must not
+        // reappear on this code path either.
+        $payment->expects(self::never())->method('setParentTransactionId');
+
+        $this->makeReconciler()->execute();
+    }
+
+    /**
+     * Session 3 Priority 3.1 (architect-scope §3.1.4) — explicit happy-path
+     * regression guard for the reconciler's `handleApproved` branch (both
+     * direct-sale and preauth, which previously called
+     * `setParentTransactionId('{increment_id}-auth')`). The setter is gone
+     * from both branches and must never reappear.
+     */
+    public function testApprovedBranchNeverCallsSetParentTransactionId(): void
+    {
+        [$order, $payment] = $this->primeOrder(
+            flittOrderId: 'duka_000000055_1700000000',
+            createdAt: (new \DateTimeImmutable('-30 minutes'))->format('Y-m-d H:i:s'),
+            grandTotal: 50.00,
+        );
+        $this->primeOrderSearch([$order]);
+
+        $this->statusClient->method('checkStatus')->willReturn([
+            'response' => [
+                'order_status'    => 'approved',
+                'response_status' => 'success',
+                'payment_id'      => 'pay-77',
+                'amount'          => 5000,
+            ],
+        ]);
+        $this->callbackValidator->method('validate')->willReturn(true);
+
+        // Direct-sale branch.
+        $this->config->method('isPreauth')->willReturn(false);
+
+        $payment->expects(self::never())->method('setParentTransactionId');
+
+        $this->makeReconciler()->execute();
+    }
+
+    /**
+     * Same regression guard but for the preauth branch (the second
+     * `setParentTransactionId` site identified by architect-scope §3.1.1).
+     */
+    public function testApprovedPreauthBranchNeverCallsSetParentTransactionId(): void
+    {
+        [$order, $payment] = $this->primeOrder(
+            flittOrderId: 'duka_000000055_1700000000',
+            createdAt: (new \DateTimeImmutable('-30 minutes'))->format('Y-m-d H:i:s'),
+            grandTotal: 50.00,
+        );
+        $this->primeOrderSearch([$order]);
+
+        $this->statusClient->method('checkStatus')->willReturn([
+            'response' => [
+                'order_status'    => 'approved',
+                'response_status' => 'success',
+                'payment_id'      => 'pay-78',
+                'amount'          => 5000,
+            ],
+        ]);
+        $this->callbackValidator->method('validate')->willReturn(true);
+
+        // Preauth branch.
+        $this->config->method('isPreauth')->willReturn(true);
+
+        $payment->expects(self::never())->method('setParentTransactionId');
+
         $this->makeReconciler()->execute();
     }
 
@@ -181,21 +251,40 @@ class PendingOrderReconcilerTest extends TestCase
     private function primeOrder(
         string $flittOrderId,
         string $createdAt,
+        float $grandTotal = 50.00,
     ): array {
+        // We mock every payment method that handleApproved could possibly
+        // call, INCLUDING setParentTransactionId — even though it's the
+        // method we're asserting must never run. PHPUnit's `expects(never)`
+        // semantics require the method to be on the mock surface.
         $payment = $this->getMockBuilder(Payment::class)
             ->disableOriginalConstructor()
-            ->onlyMethods(['getAdditionalInformation', 'getMethod'])
+            ->onlyMethods([
+                'getAdditionalInformation',
+                'setAdditionalInformation',
+                'getMethod',
+                'setTransactionId',
+                'setParentTransactionId',
+                'setIsTransactionPending',
+                'setIsTransactionClosed',
+                'registerCaptureNotification',
+            ])
             ->getMock();
         $payment->method('getAdditionalInformation')->willReturnCallback(
             static fn(?string $key = null) => $key === 'flitt_order_id' ? $flittOrderId : null
         );
         $payment->method('getMethod')->willReturn(ConfigProvider::CODE);
+        $payment->method('setAdditionalInformation')->willReturnSelf();
+        $payment->method('setTransactionId')->willReturnSelf();
+        $payment->method('setIsTransactionPending')->willReturnSelf();
+        $payment->method('setIsTransactionClosed')->willReturnSelf();
 
         $order = $this->getMockBuilder(Order::class)
             ->disableOriginalConstructor()
             ->onlyMethods([
                 'getPayment', 'getIncrementId', 'getStoreId', 'getCreatedAt',
                 'cancel', 'addCommentToStatusHistory', 'getState',
+                'setState', 'setStatus', 'getGrandTotal',
             ])
             ->getMock();
         $order->method('getPayment')->willReturn($payment);
@@ -203,6 +292,8 @@ class PendingOrderReconcilerTest extends TestCase
         $order->method('getStoreId')->willReturn(1);
         $order->method('getCreatedAt')->willReturn($createdAt);
         $order->method('getState')->willReturn(Order::STATE_PENDING_PAYMENT);
+        $order->method('getGrandTotal')->willReturn($grandTotal);
+        $order->method('addCommentToStatusHistory')->willReturnSelf();
 
         return [$order, $payment];
     }

@@ -94,7 +94,13 @@ class ReturnActionTest extends TestCase
 
     public function testPendingStatusProcessingDoesNotRedirectToSuccess(): void
     {
-        $this->primeFlittStatus('processing');
+        [, $payment] = $this->primeFlittStatus('processing');
+
+        // Session 3 Priority 3.1 regression guard — pending statuses must
+        // NEVER reach the handleApproved branch where the (now-removed)
+        // setParentTransactionId used to live.
+        $payment->expects(self::never())->method('setParentTransactionId');
+
         $this->buildController()->execute();
 
         self::assertSame(['checkout'], $this->redirectTargets);
@@ -104,7 +110,9 @@ class ReturnActionTest extends TestCase
 
     public function testPendingStatusCreatedDoesNotRedirectToSuccess(): void
     {
-        $this->primeFlittStatus('created');
+        [, $payment] = $this->primeFlittStatus('created');
+        $payment->expects(self::never())->method('setParentTransactionId');
+
         $this->buildController()->execute();
 
         self::assertSame(['checkout'], $this->redirectTargets);
@@ -114,10 +122,53 @@ class ReturnActionTest extends TestCase
     public function testDeclinedStatusRedirectsToCheckoutViaHandleFailure(): void
     {
         // Baseline: declined should still cancel via handleFailure -> /checkout
-        $this->primeFlittStatus('declined', cancelable: true);
+        [, $payment] = $this->primeFlittStatus('declined', cancelable: true);
+
+        // Decline path also bypasses handleApproved — the dropped setter
+        // must not reappear on this branch either.
+        $payment->expects(self::never())->method('setParentTransactionId');
+
         $this->buildController()->execute();
 
         self::assertSame(['checkout'], $this->redirectTargets);
+    }
+
+    /**
+     * Session 3 Priority 3.1 (architect-scope §3.1.4) — explicit happy-path
+     * regression guard. Even when Flitt reports `approved` and we descend
+     * into handleApproved, the previously-dangling `setParentTransactionId`
+     * call must NOT reappear. This test stops at the row-lock stage (we
+     * deliberately do not stand up the full DB-transaction harness here —
+     * the equivalent end-to-end happy path is exercised by ConfirmTest's
+     * preauth/direct-sale variants and by the Playwright lifecycle suite);
+     * the contract we're pinning is "the setter is gone".
+     */
+    public function testApprovedStatusNeverCallsSetParentTransactionId(): void
+    {
+        [$order, $payment] = $this->primeFlittStatus('approved', cancelable: true);
+
+        $this->callbackValidator->method('validate')->willReturn(true);
+
+        // Force handleApproved to short-circuit at the row-lock stage so
+        // we don't have to stand up the full DB-transaction harness — the
+        // assertion we care about (setParentTransactionId never called)
+        // applies on every code path through the controller.
+        $connection = $this->createMock(\Magento\Framework\DB\Adapter\AdapterInterface::class);
+        $select = $this->createMock(\Magento\Framework\DB\Select::class);
+        $select->method('from')->willReturnSelf();
+        $select->method('where')->willReturnSelf();
+        $select->method('forUpdate')->willReturnSelf();
+        $connection->method('select')->willReturn($select);
+        // Row vanished: handleApproved rolls back and redirects to failure
+        // before any setter on the payment runs.
+        $connection->method('fetchRow')->willReturn(false);
+        $this->resourceConnection->method('getConnection')->willReturn($connection);
+        $this->resourceConnection->method('getTableName')
+            ->willReturnCallback(static fn (string $name): string => $name);
+
+        $payment->expects(self::never())->method('setParentTransactionId');
+
+        $this->buildController()->execute();
     }
 
     /**
@@ -142,7 +193,10 @@ class ReturnActionTest extends TestCase
         );
     }
 
-    private function primeFlittStatus(string $status, bool $cancelable = false): void
+    /**
+     * @return array{0: Order&MockObject, 1: Payment&MockObject}
+     */
+    private function primeFlittStatus(string $status, bool $cancelable = false): array
     {
         $this->request->method('getParam')->willReturnCallback(
             static fn (string $k, mixed $d = null): mixed
@@ -175,6 +229,8 @@ class ReturnActionTest extends TestCase
 
         $this->statusClient->method('checkStatus')
             ->willReturn(['response' => ['order_status' => $status]]);
+
+        return [$order, $payment];
     }
 
     private function buildController(): ReturnAction

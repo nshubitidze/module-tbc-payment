@@ -271,3 +271,56 @@ If a Flitt refund fails again in production:
    `order_increment_id` + `request_id`.
 
 End of RCA.
+
+---
+
+## Pass 4 follow-up (2026-04-25)
+
+Reviewer (`docs/reviewer-signoff.md` M-1) caught a real failure-path
+regression introduced by the Pass 1 dual-fix. Both Change A
+(`RefundHandler` -> `UserFacingErrorMapper`) and Change B (validator
+wired on `ShuboTbcRefundCommand`) were landed simultaneously, but
+`Magento\Payment\Gateway\Command\GatewayCommand::execute()` runs the
+validator BEFORE the handler:
+
+```php
+// vendor/magento/module-payment/Gateway/Command/GatewayCommand.php:99-122
+$response = $this->client->placeRequest($transferO);
+if ($this->validator !== null) {
+    $result = $this->validator->validate(...);
+    if (!$result->isValid()) {
+        $this->processErrors($result);   // throws CommandException, NEVER reaches handler
+    }
+}
+if ($this->handler) {
+    $this->handler->handle($commandSubject, $response);
+}
+```
+
+On a Flitt failure (e.g. 1002 "Application error"), `ResponseValidator`
+returns invalid -> `processErrors` throws a generic `CommandException`
+with Magento's default copy `"Transaction has been declined. Please try
+again later."`. `RefundHandler::handle()` is never invoked, so the
+friendly Georgian/English mapped message from `UserFacingErrorMapper`
+never reaches the admin toast. Change B silently overrode Change A.
+
+**Pass 4 fix:** drop the validator from `ShuboTbcRefundCommand` (option
+(a) of reviewer-signoff §M-1). The friendly-message UX promise of
+P1.1 depends on `RefundHandler` running, so the handler is now the
+**sole gatekeeper** for refund response validation. The Magento
+gateway-contract conformance argument that motivated Change B is
+superseded by the user-experience argument: the alternative
+(implementing `ErrorMessageMapperInterface`) is more code for no
+behavioural improvement on this hot path.
+
+`UserFacingErrorMapper` is now reachable on every Flitt failure
+through `RefundHandler::handle()`. The `Test/Unit/Gateway/Command/
+RefundCommandPipelineTest.php` integration-style test pins the
+end-to-end behaviour (see §9): real `GatewayCommand` constructor + real
+`RefundRequestBuilder` + stub `RefundClient` returning a 1002 envelope
++ real `RefundHandler` -> friendly mapped `LocalizedException`, NOT
+Magento's generic `CommandException`.
+
+The architect-scope §1.1.5 hint that Change B was "less testable but
+works" was wrong in the literal sense: with the validator in place the
+handler-side mapper IS the dead code, not the other way around.
