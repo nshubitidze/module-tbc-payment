@@ -7,6 +7,7 @@ namespace Shubo\TbcPayment\Controller\Payment;
 use Magento\Checkout\Model\Session as CheckoutSession;
 use Magento\Framework\Api\SearchCriteriaBuilder;
 use Magento\Framework\App\Action\HttpGetActionInterface;
+use Magento\Framework\App\Action\HttpPostActionInterface;
 use Magento\Framework\App\CsrfAwareActionInterface;
 use Magento\Framework\App\Request\InvalidRequestException;
 use Magento\Framework\App\RequestInterface;
@@ -35,7 +36,7 @@ use Shubo\TbcPayment\Service\SettlementService;
  * safety nets: if this controller fails or the customer closes the browser, those
  * will finalize the order asynchronously.
  */
-class ReturnAction implements HttpGetActionInterface, CsrfAwareActionInterface
+class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, CsrfAwareActionInterface
 {
     /**
      * @param \Magento\Framework\App\Request\Http $request

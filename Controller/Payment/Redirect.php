@@ -13,7 +13,7 @@ use Magento\Framework\HTTP\Client\CurlFactory;
 use Magento\Framework\Locale\ResolverInterface;
 use Magento\Framework\Serialize\Serializer\Json;
 use Magento\Framework\UrlInterface;
-use Magento\Sales\Api\OrderRepositoryInterface;
+use Magento\Sales\Api\OrderPaymentRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
@@ -34,13 +34,13 @@ class Redirect implements HttpPostActionInterface
     public function __construct(
         private readonly JsonFactory $jsonFactory,
         private readonly CheckoutSession $checkoutSession,
-        private readonly OrderRepositoryInterface $orderRepository,
         private readonly Config $config,
         private readonly UrlInterface $urlBuilder,
         private readonly LoggerInterface $logger,
         private readonly CurlFactory $curlFactory,
         private readonly Json $json,
         private readonly ResolverInterface $localeResolver,
+        private readonly OrderPaymentRepositoryInterface $paymentRepository,
     ) {
     }
 
@@ -117,7 +117,12 @@ class Redirect implements HttpPostActionInterface
             }
             $payment->setAdditionalInformation('flitt_order_id', $flittOrderId);
             $payment->setAdditionalInformation('checkout_type', 'redirect');
-            $this->orderRepository->save($order);
+            // Persist via the payment repository explicitly. `orderRepository->save($order)`
+            // does NOT reliably cascade changes to `additional_information` on an
+            // order loaded via `checkoutSession->getLastRealOrder()` — observed
+            // in production: flitt_order_id silently dropped, ReturnAction then
+            // fails to match the order returned by Flitt, customer sees an error.
+            $this->paymentRepository->save($payment);
 
             $this->logger->debug('TBC redirect: checkout URL obtained', [
                 'order_id'      => $incrementId,
@@ -150,15 +155,17 @@ class Redirect implements HttpPostActionInterface
     /**
      * Exchange signed params for a Flitt checkout URL via the API.
      *
-     * The /api/checkout/token endpoint returns both a token (for embed) and a
-     * checkout_url (for redirect). We use the checkout_url here.
+     * Flitt has two endpoints:
+     *   /api/checkout/token  -> returns `token` only (for embedded SDK)
+     *   /api/checkout/url    -> returns `checkout_url` + `payment_id` (for redirect)
+     * We use the URL endpoint here.
      *
      * @param array<string, mixed> $params Signed payment parameters
      * @throws LocalizedException When the API call fails or returns an error
      */
     private function requestCheckoutUrl(string $apiUrl, array $params, int $storeId): string
     {
-        $tokenUrl = $apiUrl . '/api/checkout/token';
+        $tokenUrl = $apiUrl . '/api/checkout/url';
         $requestBody = $this->json->serialize(['request' => $params]);
 
         $curl = $this->curlFactory->create();
