@@ -1,5 +1,9 @@
 # Shubo_TbcPayment -- TBC Bank (Flitt) Payment Module for Magento 2
 
+[![Packagist](https://img.shields.io/badge/packagist-shubo%2Fmodule--tbc--payment-orange.svg)](https://packagist.org/packages/shubo/module-tbc-payment)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
+[![Magento](https://img.shields.io/badge/Magento-2.4.x-8a2be2.svg)](https://magento.com)
+
 TBC Bank card payment integration for Magento 2 using the [Flitt](https://flitt.com) Embed Checkout SDK. Customers enter card details directly on your checkout page without being redirected to an external payment page.
 
 > **IMPORTANT DISCLAIMER**: This module has NOT been tested in production with real transactions. It has been developed and tested against sandbox/test environments only. Thorough testing with real payment credentials and real cards is required before going live.
