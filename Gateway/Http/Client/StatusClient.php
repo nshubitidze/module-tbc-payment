@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace Shubo\TbcPayment\Gateway\Http\Client;
 
-use Magento\Framework\HTTP\Client\CurlFactory;
-use Magento\Framework\Serialize\Serializer\Json;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
@@ -14,21 +12,16 @@ use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
  * Standalone HTTP client for checking payment status via Flitt API.
  *
  * Not part of the gateway command pool — used directly by the cron reconciler.
+ * Status checks are idempotent reads, so this is the ONLY client that opts in to
+ * the bounded retry in {@see FlittHttpClient::post()}.
  */
 class StatusClient
 {
     private const ENDPOINT = '/api/status/order_id';
 
-    /**
-     * @param Config $config
-     * @param CurlFactory $curlFactory
-     * @param Json $json
-     * @param LoggerInterface $logger
-     */
     public function __construct(
         private readonly Config $config,
-        private readonly CurlFactory $curlFactory,
-        private readonly Json $json,
+        private readonly FlittHttpClient $httpClient,
         private readonly LoggerInterface $logger,
     ) {
     }
@@ -36,9 +29,15 @@ class StatusClient
     /**
      * Check payment status for a given Flitt order ID.
      *
+     * The Flitt status payload is nested under a top-level `response` key. This
+     * method unwraps that envelope and returns the inner `response` array (or the
+     * whole decoded body if it is absent or non-array, e.g. a malformed reply) so
+     * every caller receives the status fields (order_status, amount, payment_id,
+     * response_status, error_code, …) directly without repeating the unwrap.
+     *
      * @param string $orderId The Flitt order_id (e.g. "duka_000000042_1743998765")
      * @param int $storeId Store ID for config lookup
-     * @return array<string, mixed> Flitt response containing order_status, amount, payment_id, etc.
+     * @return array<string, mixed> Unwrapped Flitt status payload (order_status, amount, payment_id, etc.)
      * @throws FlittApiException
      */
     public function checkStatus(string $orderId, int $storeId): array
@@ -53,57 +52,27 @@ class StatusClient
 
         $params['signature'] = Config::generateSignature($params, $password);
 
-        $requestBody = ['request' => $params];
-        $url = $this->config->getApiUrl($storeId) . self::ENDPOINT;
-
         if ($this->config->isDebugEnabled($storeId)) {
             $this->logger->debug('Flitt Status request', [
-                'url' => $url,
+                'endpoint' => self::ENDPOINT,
                 'params' => $this->sanitizeForLog($params),
             ]);
         }
 
-        try {
-            $curl = $this->curlFactory->create();
-            $curl->addHeader('Content-Type', 'application/json');
-            $curl->setOptions([CURLOPT_TIMEOUT => 30]);
-            $curl->post($url, (string) $this->json->serialize($requestBody));
+        // Status reads are idempotent — safe to retry on transport failure.
+        $body = $this->httpClient->post(self::ENDPOINT, ['request' => $params], $storeId, retryable: true);
 
-            $responseBody = $curl->getBody();
-            $statusCode = $curl->getStatus();
+        // Flitt nests the status fields under `response`. Unwrap here so callers
+        // do not each repeat `$body['response'] ?? $body`. When the `response`
+        // envelope is absent (malformed reply) we fall back to the whole body.
+        // NOTE: this is equivalent-or-better, not byte-identical to the old
+        // per-caller behaviour. For the pathological case where `response` is a
+        // SCALAR string, the old reconciler treated the unwrap as unusable and
+        // bailed; here we fall through and return the outer body array, giving
+        // the caller the rest of the fields to work with rather than nothing.
+        $response = $body['response'] ?? $body;
 
-            if ($this->config->isDebugEnabled($storeId)) {
-                $this->logger->debug('Flitt Status response', [
-                    'status' => $statusCode,
-                    'body' => $responseBody,
-                ]);
-            }
-
-            if ($statusCode < 200 || $statusCode >= 300) {
-                throw new FlittApiException(
-                    __('Flitt status API returned HTTP %1', $statusCode)
-                );
-            }
-
-            $response = $this->json->unserialize($responseBody);
-
-            if (!is_array($response)) {
-                throw new FlittApiException(__('Invalid status response from Flitt API'));
-            }
-
-            return $response;
-        } catch (FlittApiException $e) {
-            throw $e;
-        } catch (\Exception $e) {
-            $this->logger->error('Flitt Status error: ' . $e->getMessage(), [
-                'exception' => $e,
-                'order_id' => $orderId,
-            ]);
-            throw new FlittApiException(
-                __('Unable to check payment status via TBC payment gateway.'),
-                $e
-            );
-        }
+        return is_array($response) ? $response : $body;
     }
 
     /**

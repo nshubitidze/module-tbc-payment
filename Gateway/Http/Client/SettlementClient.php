@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Shubo\TbcPayment\Gateway\Http\Client;
 
-use Magento\Framework\HTTP\Client\CurlFactory;
 use Magento\Framework\Serialize\Serializer\Json;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
@@ -13,8 +12,14 @@ use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
 /**
  * HTTP client for Flitt settlement (split payment distribution) operations.
  *
- * Settlement uses a different request format than other Flitt APIs:
- * the order data is base64-encoded and the signature is sha1(password|base64_data).
+ * Settlement uses a different request format than other Flitt APIs: the order
+ * data is base64-encoded and the signature is the v2 sha1(password|base64_data).
+ * This client owns that base64 + v2-signature shaping and serializes the finished
+ * {"request":{version,data,signature}} envelope itself, then hands the raw body
+ * string to {@see FlittHttpClient} for transport.
+ *
+ * Settlement is non-idempotent (a retried settle double-distributes funds), so it
+ * never passes retryable = true.
  */
 class SettlementClient
 {
@@ -22,7 +27,7 @@ class SettlementClient
 
     public function __construct(
         private readonly Config $config,
-        private readonly CurlFactory $curlFactory,
+        private readonly FlittHttpClient $httpClient,
         private readonly Json $json,
         private readonly LoggerInterface $logger,
     ) {
@@ -39,7 +44,6 @@ class SettlementClient
     public function settle(array $orderData, int $storeId): array
     {
         $password = $this->config->getPassword($storeId);
-        $url = $this->config->getApiUrl($storeId) . self::ENDPOINT;
 
         $dataJson = (string) $this->json->serialize(['order' => $orderData]);
         $dataBase64 = base64_encode($dataJson);
@@ -56,51 +60,14 @@ class SettlementClient
 
         if ($this->config->isDebugEnabled($storeId)) {
             $this->logger->debug('Flitt Settlement request', [
-                'url' => $url,
+                'endpoint' => self::ENDPOINT,
                 'order_data' => $this->sanitizeForLog($orderData),
             ]);
         }
 
-        try {
-            $curl = $this->curlFactory->create();
-            $curl->addHeader('Content-Type', 'application/json');
-            $curl->setOptions([CURLOPT_TIMEOUT => 30]);
-            $curl->post($url, $requestBody);
-
-            $responseBody = $curl->getBody();
-            $statusCode = $curl->getStatus();
-
-            if ($this->config->isDebugEnabled($storeId)) {
-                $this->logger->debug('Flitt Settlement response', [
-                    'status' => $statusCode,
-                    'body' => $responseBody,
-                ]);
-            }
-
-            if ($statusCode < 200 || $statusCode >= 300) {
-                throw new FlittApiException(
-                    __('Flitt settlement API returned HTTP %1', $statusCode)
-                );
-            }
-
-            $response = $this->json->unserialize($responseBody);
-
-            if (!is_array($response)) {
-                throw new FlittApiException(__('Invalid settlement response from Flitt API'));
-            }
-
-            return $response;
-        } catch (FlittApiException $e) {
-            throw $e;
-        } catch (\Exception $e) {
-            $this->logger->error('Flitt Settlement error: ' . $e->getMessage(), [
-                'exception' => $e,
-            ]);
-            throw new FlittApiException(
-                __('Unable to process settlement via TBC payment gateway.'),
-                $e
-            );
-        }
+        // Hand the pre-serialized v2 envelope to the shared transport as a raw body
+        // so FlittHttpClient never learns about settlement signing.
+        return $this->httpClient->post(self::ENDPOINT, $requestBody, $storeId);
     }
 
     /**

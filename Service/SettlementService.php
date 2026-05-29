@@ -24,6 +24,15 @@ use Shubo\TbcPayment\Gateway\Http\Client\SettlementClient;
 class SettlementService
 {
     /**
+     * Flitt `response_status` values that mean the settlement genuinely
+     * succeeded — the only values that make settlement terminal for the
+     * already-settled guard.
+     *
+     * @var list<string>
+     */
+    private const SUCCESS_STATUSES = ['success', 'approved'];
+
+    /**
      * @param Config $config TBC payment configuration
      * @param SettlementClient $settlementClient Flitt settlement API client
      * @param EventManagerInterface $eventManager Event manager for receiver collection
@@ -75,8 +84,15 @@ class SettlementService
             return false;
         }
 
-        // Check if already settled
-        if ($payment->getAdditionalInformation('settlement_status')) {
+        // IMPROVE-4: only a GENUINELY successful prior settlement is terminal.
+        // A failed attempt must stay retryable — previously ANY truthy
+        // settlement_status (including 'failure'/'declined' persisted below
+        // before the success check) short-circuited this guard FOREVER and
+        // also hid the admin Settle button, leaving the merchant payout stuck.
+        // We now persist the failure status under a separate, non-blocking key
+        // (`settlement_last_status`) and only set the blocking `settlement_status`
+        // on success — see the response handling below and AddSettleButton.
+        if ($this->isAlreadySettled($payment)) {
             $this->logger->info('Settlement skipped: already settled', [
                 'order_id' => $order->getIncrementId(),
             ]);
@@ -139,13 +155,17 @@ class SettlementService
                 ? (string) ($responseOrder['response_status'] ?? ($responseOrder['reverse_status'] ?? ''))
                 : '';
 
-            $payment->setAdditionalInformation('settlement_status', $status);
             $payment->setAdditionalInformation(
                 'settlement_receivers',
                 $this->json->serialize($receiverData)
             );
 
-            if ($status === 'success' || $status === 'approved') {
+            if (in_array($status, self::SUCCESS_STATUSES, true)) {
+                // Only a genuine success stamps the BLOCKING terminal key. This
+                // is the single place `settlement_status` is set to a value that
+                // satisfies isAlreadySettled() and hides the admin Settle button.
+                $payment->setAdditionalInformation('settlement_status', $status);
+                $payment->setAdditionalInformation('settlement_last_status', $status);
                 $order->addCommentToStatusHistory(
                     (string) __('Payment settlement sent to %1 receiver(s).', count($receiverData))
                 );
@@ -156,15 +176,22 @@ class SettlementService
                 return true;
             }
 
+            // IMPROVE-4: a failed reply records its status under the
+            // NON-blocking key only. settlement_status stays empty so the guard
+            // does not short-circuit and the admin Settle button stays visible —
+            // the failure remains retryable (a fresh distinct order_id suffix on
+            // the next attempt avoids Flitt's duplicate-order_id rejection).
+            $payment->setAdditionalInformation('settlement_last_status', $status !== '' ? $status : 'failure');
             $errorMsg = is_array($responseOrder)
                 ? (string) ($responseOrder['error_message']
                     ?? ($responseOrder['response_description'] ?? 'Unknown error'))
                 : 'Unknown error';
             $order->addCommentToStatusHistory(
-                (string) __('Payment settlement failed: %1', $errorMsg)
+                (string) __('Payment settlement failed (retryable): %1', $errorMsg)
             );
             $this->logger->error('Settlement failed', [
                 'order_id' => $order->getIncrementId(),
+                'attempt' => $attempt,
                 'response' => $responseOrder,
             ]);
             return false;
@@ -175,6 +202,22 @@ class SettlementService
             ]);
             return false;
         }
+    }
+
+    /**
+     * Whether the payment has a GENUINELY-successful, terminal settlement.
+     *
+     * Shared by the settle() guard, the recovery cron, and the admin
+     * AddSettleButton plugin so all three agree on what "already settled"
+     * means. A failure recorded under `settlement_last_status` does NOT count.
+     *
+     * @param Payment $payment Order payment carrying settlement state
+     */
+    public function isAlreadySettled(Payment $payment): bool
+    {
+        $status = (string) $payment->getAdditionalInformation('settlement_status');
+
+        return in_array($status, self::SUCCESS_STATUSES, true);
     }
 
     /**
@@ -245,6 +288,7 @@ class SettlementService
     {
         $result = [];
         $fixedTotal = 0;
+        /** @var list<array{merchant_id: int, basis_points: int, description: string}> $percentReceivers */
         $percentReceivers = [];
 
         // First pass: process fixed amounts
@@ -259,7 +303,11 @@ class SettlementService
             }
 
             if ($amountType === 'fixed') {
-                $amount = (int) round((float) $amountValue * 100);
+                // IMPROVE-10: convert GEL → tetri via bcmath, never float
+                // multiplication. bcmul to 2dp then strip the fractional part
+                // keeps the value exact for inputs like "0.10" that float would
+                // store as 0.0999999…
+                $amount = (int) bcmul($this->normalizeMoney($amountValue), '100', 0);
                 $fixedTotal += $amount;
                 $result[] = [
                     'type' => 'merchant',
@@ -270,9 +318,11 @@ class SettlementService
                     ],
                 ];
             } else {
+                // IMPROVE-10: percent stored as integer basis points (1% = 100
+                // bp) via bcmath so "33.33" → 3333 exactly with no float drift.
                 $percentReceivers[] = [
                     'merchant_id' => $merchantId,
-                    'percent' => (float) $amountValue,
+                    'basis_points' => (int) bcmul($this->normalizeMoney($amountValue), '100', 0),
                     'description' => $description,
                 ];
             }
@@ -287,26 +337,111 @@ class SettlementService
             return [];
         }
 
-        // Second pass: process percentage receivers (from remaining after fixed)
-        $remainingAmount = $totalAmount - $fixedTotal;
-        foreach ($percentReceivers as $pr) {
-            $amount = (int) round($remainingAmount * ($pr['percent'] / 100));
+        // IMPROVE-10: validate the percentage sum does not exceed 100%
+        // (10000 basis points). Previously only the fixed-amount overflow was
+        // checked, so a 60/60 split silently over-allocated the remainder.
+        $totalBasisPoints = array_sum(array_column($percentReceivers, 'basis_points'));
+        if ($totalBasisPoints > 10000) {
+            $this->logger->error('Settlement skipped: percentage receivers exceed 100%', [
+                'total_percent' => bcdiv((string) $totalBasisPoints, '100', 2),
+                'order_total' => $totalAmount,
+            ]);
+            return [];
+        }
+
+        return array_merge(
+            $result,
+            $this->allocatePercentReceivers($percentReceivers, $totalAmount - $fixedTotal)
+        );
+    }
+
+    /**
+     * Allocate the post-fixed remainder across percentage receivers using
+     * integer tetri math with a deterministic rounding remainder.
+     *
+     * Each receiver's share is floor(remaining * basisPoints / 10000) in
+     * integer tetri (no float). The cumulative floor loses up to (n-1) tetri to
+     * truncation; that residue is added to the LAST positive receiver so the
+     * sum of percentage shares reconciles EXACTLY to the intended slice of the
+     * order — Σreceivers never drifts ±1 and never exceeds the total. The
+     * "intended slice" is remaining * ΣbasisPoints / 10000 (== remaining when
+     * the percentages sum to 100%), so a partial split leaves the rest with the
+     * main merchant by design.
+     *
+     * @param list<array{merchant_id: int, basis_points: int, description: string}> $percentReceivers
+     * @param int $remaining Tetri left after fixed receivers
+     * @return list<array<string, mixed>>
+     */
+    private function allocatePercentReceivers(array $percentReceivers, int $remaining): array
+    {
+        if ($remaining <= 0 || $percentReceivers === []) {
+            return [];
+        }
+
+        $totalBasisPoints = array_sum(array_column($percentReceivers, 'basis_points'));
+        if ($totalBasisPoints <= 0) {
+            return [];
+        }
+
+        // Intended total to distribute across percentage receivers (integer
+        // tetri). For a full 100% split this equals $remaining exactly.
+        $intendedTotal = intdiv($remaining * $totalBasisPoints, 10000);
+
+        $shares = [];
+        $allocated = 0;
+        $lastPositiveIndex = null;
+        foreach ($percentReceivers as $index => $pr) {
+            $share = intdiv($remaining * $pr['basis_points'], 10000);
+            $shares[$index] = $share;
+            $allocated += $share;
+            if ($share > 0) {
+                $lastPositiveIndex = $index;
+            }
+        }
+
+        // Deterministically assign the truncation remainder to the last
+        // positive receiver so Σshares === $intendedTotal exactly.
+        if ($lastPositiveIndex !== null) {
+            $shares[$lastPositiveIndex] += $intendedTotal - $allocated;
+        }
+
+        $allocatedResult = [];
+        foreach ($percentReceivers as $index => $pr) {
+            $amount = $shares[$index];
             if ($amount <= 0) {
                 continue;
             }
-            $desc = $pr['description'] !== ''
-                ? $pr['description']
-                : (string) __('Payment split');
-            $result[] = [
+            $allocatedResult[] = [
                 'type' => 'merchant',
                 'requisites' => [
-                    'merchant_id' => (int) $pr['merchant_id'],
+                    'merchant_id' => $pr['merchant_id'],
                     'amount' => $amount,
-                    'settlement_description' => $desc,
+                    'settlement_description' => $pr['description'] !== ''
+                        ? $pr['description']
+                        : (string) __('Payment split'),
                 ],
             ];
         }
 
-        return $result;
+        return $allocatedResult;
+    }
+
+    /**
+     * Normalise a money/percentage string to a fixed 2-decimal bcmath operand.
+     *
+     * Coerces empty/non-numeric input to "0.00" and rounds to 2dp via bcadd so
+     * downstream bcmul/bcdiv operate on a clean, scale-stable value. Avoids any
+     * float intermediate — the whole point of the IMPROVE-10 rewrite.
+     *
+     * @param string $value Raw admin-entered value (GEL or percent)
+     */
+    private function normalizeMoney(string $value): string
+    {
+        $trimmed = trim($value);
+        if ($trimmed === '' || !is_numeric($trimmed)) {
+            return '0.00';
+        }
+
+        return bcadd($trimmed, '0', 2);
     }
 }

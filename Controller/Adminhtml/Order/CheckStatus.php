@@ -12,11 +12,14 @@ use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
-use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
-use Shubo\TbcPayment\Gateway\Response\PaymentInfoKeys;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
+use Shubo\TbcPayment\Model\FlittStatus;
 use Shubo\TbcPayment\Model\Ui\ConfigProvider;
+use Shubo\TbcPayment\Service\ApprovalContext;
+use Shubo\TbcPayment\Service\ApprovalResult;
+use Shubo\TbcPayment\Service\OrderApprovalApplier;
+use Shubo\TbcPayment\Service\PaymentLock;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -34,9 +37,10 @@ class CheckStatus extends Action
         private readonly OrderRepositoryInterface $orderRepository,
         private readonly StatusClient $statusClient,
         private readonly CallbackValidator $callbackValidator,
-        private readonly Config $config,
+        private readonly OrderApprovalApplier $approvalApplier,
         private readonly SettlementService $settlementService,
         private readonly LoggerInterface $logger,
+        private readonly PaymentLock $paymentLock,
     ) {
         parent::__construct($context);
     }
@@ -62,8 +66,8 @@ class CheckStatus extends Action
             }
 
             $storeId = (int) $order->getStoreId();
-            $response = $this->statusClient->checkStatus($flittOrderId, $storeId);
-            $responseData = $response['response'] ?? $response;
+            // StatusClient::checkStatus already unwraps the Flitt `response` envelope.
+            $responseData = $this->statusClient->checkStatus($flittOrderId, $storeId);
             $flittStatus = $responseData['order_status'] ?? 'unknown';
 
             $this->messageManager->addSuccessMessage(
@@ -76,7 +80,7 @@ class CheckStatus extends Action
 
             // If Flitt says approved but order is still pending — process it
             if (
-                $flittStatus === 'approved'
+                $flittStatus === FlittStatus::APPROVED
                 && in_array($order->getState(), [Order::STATE_PAYMENT_REVIEW, Order::STATE_PENDING_PAYMENT], true)
             ) {
                 if (!$this->callbackValidator->validate($responseData, $storeId)) {
@@ -84,25 +88,41 @@ class CheckStatus extends Action
                     return $resultRedirect->setPath('sales/order/view', ['order_id' => $orderId]);
                 }
 
-                $this->processApproval($order, $payment, $responseData, $storeId);
-                $this->orderRepository->save($order);
+                // IMPROVE-2: serialize against the frontend capture paths + cron
+                // via the advisory lock, keyed by flitt_order_id. On contention a
+                // concurrent path is finalising the order — tell the admin to
+                // refresh rather than racing a second capture.
+                $applyResult = $this->paymentLock->withLock(
+                    $flittOrderId,
+                    fn (): ApprovalResult => $this->applyApproval($orderId, $responseData)
+                );
 
-                // Trigger settlement if configured
-                try {
-                    $this->settlementService->settle($order);
-                    $this->orderRepository->save($order);
-                } catch (\Exception $e) {
-                    $this->logger->error('Settlement after manual status check failed', [
-                        'order_id' => $order->getIncrementId(),
-                        'error' => $e->getMessage(),
-                    ]);
+                if ($applyResult === null) {
+                    $this->messageManager->addNoticeMessage(
+                        (string) __('Another process is finalising this payment. Please refresh in a moment.')
+                    );
+                    return $resultRedirect->setPath('sales/order/view', ['order_id' => $orderId]);
+                }
+
+                // IMPROVE-8: the applier refused the capture because the Flitt
+                // amount diverged from the order grand total (cart edited
+                // mid-flow). It logged at `critical` and mutated nothing; surface
+                // it to the admin and leave the order for manual reconciliation.
+                if ($applyResult === ApprovalResult::RefusedAmountMismatch) {
+                    $this->messageManager->addErrorMessage(
+                        (string) __(
+                            'Payment amount does not match the order total. Capture refused. '
+                            . 'Please reconcile this order manually.'
+                        )
+                    );
+                    return $resultRedirect->setPath('sales/order/view', ['order_id' => $orderId]);
                 }
 
                 $this->messageManager->addSuccessMessage(
                     (string) __('Order updated to processing. Payment captured.')
                 );
             } elseif (
-                in_array($flittStatus, ['declined', 'expired'], true)
+                in_array($flittStatus, [FlittStatus::DECLINED, FlittStatus::EXPIRED], true)
                 && $order->getState() !== Order::STATE_CANCELED
             ) {
                 $order->cancel();
@@ -150,48 +170,54 @@ class CheckStatus extends Action
     }
 
     /**
-     * Process an approved payment — mirrors Callback::handleApproved().
-     */
-    /**
+     * Apply the shared approve mutation while holding the PaymentLock.
+     *
+     * RELOADS the order from the repository inside the lock so the state
+     * re-check reads committed state, not the pre-lock snapshot taken in
+     * execute(). A serialized callback-then-CheckStatus (or two clicks) where a
+     * concurrent path already promoted the order to PROCESSING is then a no-op:
+     * we observe the persisted PROCESSING state on the fresh read and skip,
+     * never re-entering apply() / re-firing registerCaptureNotification.
+     * Persists + settles only on a real capture.
+     *
      * @param array<string, mixed> $responseData
      */
-    private function processApproval(Order $order, Payment $payment, array $responseData, int $storeId): void
+    private function applyApproval(int $orderId, array $responseData): ApprovalResult
     {
-        // Store callback-equivalent data
-        PaymentInfoKeys::apply($payment, $responseData);
+        // Reload inside the lock: a concurrent capture path may have promoted
+        // the order since the pre-lock state check in execute().
+        /** @var Order $order */
+        $order = $this->orderRepository->get($orderId);
 
-        $payment->setAdditionalInformation('awaiting_flitt_confirmation', false);
-
-        $paymentId = (string) ($responseData['payment_id'] ?? '');
-        if ($paymentId !== '') {
-            // NOTE: We intentionally do NOT call setParentTransactionId() here.
-            // In direct-sale (non-preauth) mode there is no auth transaction upstream
-            // that the capture could point at, and inventing a synthetic
-            // "{increment_id}-auth" parent_txn_id produced dangling parent links in the
-            // admin transaction tree. When preauth capture is implemented as a
-            // distinct workflow, reintroduce the parent pointer from a REAL auth row.
-            $payment->setTransactionId($paymentId);
+        if ($order->getState() === Order::STATE_PROCESSING) {
+            $this->logger->info('TBC CheckStatus: order already processing inside lock, skipping', [
+                'order_id' => $order->getIncrementId(),
+            ]);
+            return ApprovalResult::AlreadyProcessed;
         }
 
-        if ($this->config->isPreauth($storeId)) {
-            $payment->setAdditionalInformation('preauth_approved', true);
-            $payment->setIsTransactionPending(false);
-            $payment->setIsTransactionClosed(false);
-            $order->setState(Order::STATE_PROCESSING);
-            $order->setStatus(Order::STATE_PROCESSING);
-            $order->addCommentToStatusHistory(
-                (string) __('Funds held by TBC Bank (manual status check). Payment ID: %1. Use "Capture Payment" to charge.', $paymentId)
-            );
-        } else {
-            $payment->setIsTransactionPending(false);
-            $payment->setIsTransactionClosed(true);
-            $amountMinor = (int) ($responseData['amount'] ?? (int) round($order->getGrandTotal() * 100));
-            $payment->registerCaptureNotification($amountMinor / 100);
-            $order->setState(Order::STATE_PROCESSING);
-            $order->setStatus(Order::STATE_PROCESSING);
-            $order->addCommentToStatusHistory(
-                (string) __('Payment approved by TBC Bank (manual status check). Payment ID: %1', $paymentId)
-            );
+        $applyResult = $this->approvalApplier->apply($order, $responseData, ApprovalContext::ManualStatusCheck);
+
+        // IMPROVE-8: refused capture — nothing was mutated, do not persist.
+        if ($applyResult === ApprovalResult::RefusedAmountMismatch) {
+            return $applyResult;
         }
+
+        $this->orderRepository->save($order);
+
+        // Trigger settlement only when this run actually captured.
+        if ($applyResult === ApprovalResult::Captured) {
+            try {
+                $this->settlementService->settle($order);
+                $this->orderRepository->save($order);
+            } catch (\Exception $e) {
+                $this->logger->error('Settlement after manual status check failed', [
+                    'order_id' => $order->getIncrementId(),
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $applyResult;
     }
 }

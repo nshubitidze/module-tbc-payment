@@ -7,10 +7,7 @@ namespace Shubo\TbcPayment\Test\Unit\Controller\Payment;
 use Magento\Checkout\Model\Session as CheckoutSession;
 use Magento\Framework\Controller\Result\Json as JsonResult;
 use Magento\Framework\Controller\Result\JsonFactory;
-use Magento\Framework\HTTP\Client\Curl;
-use Magento\Framework\HTTP\Client\CurlFactory;
-use Magento\Framework\Locale\ResolverInterface;
-use Magento\Framework\Serialize\Serializer\Json;
+use Shubo\TbcPayment\Service\FlittLanguageResolver;
 use Magento\Framework\UrlInterface;
 use Magento\Sales\Api\OrderPaymentRepositoryInterface;
 use Magento\Sales\Api\OrderRepositoryInterface;
@@ -22,11 +19,15 @@ use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Controller\Payment\Redirect;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
+use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
+use Shubo\TbcPayment\Gateway\Http\Client\FlittHttpClient;
 
 /**
- * Regression tests for BUG-2: Redirect controller must enforce a CURL timeout
- * so a hung Flitt token endpoint cannot exhaust PHP workers (worse than BUG-1
- * because the order already exists at this point).
+ * Redirect controller tests.
+ *
+ * Transport (curl/timeouts) now lives in FlittHttpClient and is covered by
+ * FlittHttpClientTest; these tests assert the controller's delegation, endpoint
+ * selection, persistence and double-click idempotency behaviour.
  */
 class RedirectTest extends TestCase
 {
@@ -36,10 +37,8 @@ class RedirectTest extends TestCase
     private Config&MockObject $config;
     private UrlInterface&MockObject $urlBuilder;
     private LoggerInterface&MockObject $logger;
-    private CurlFactory&MockObject $curlFactory;
-    private Json&MockObject $json;
-    private ResolverInterface&MockObject $localeResolver;
-    private Curl&MockObject $curl;
+    private FlittHttpClient&MockObject $httpClient;
+    private FlittLanguageResolver&MockObject $languageResolver;
     private JsonResult&MockObject $jsonResult;
     private OrderPaymentRepositoryInterface&MockObject $paymentRepository;
     private UserFacingErrorMapper&MockObject $userFacingErrorMapper;
@@ -52,139 +51,78 @@ class RedirectTest extends TestCase
         $this->config = $this->createMock(Config::class);
         $this->urlBuilder = $this->createMock(UrlInterface::class);
         $this->logger = $this->createMock(LoggerInterface::class);
-        $this->curlFactory = $this->createMock(CurlFactory::class);
-        $this->json = $this->createMock(Json::class);
-        $this->localeResolver = $this->createMock(ResolverInterface::class);
-        $this->curl = $this->createMock(Curl::class);
+        $this->httpClient = $this->createMock(FlittHttpClient::class);
+        $this->languageResolver = $this->createMock(FlittLanguageResolver::class);
         $this->jsonResult = $this->createMock(JsonResult::class);
         $this->paymentRepository = $this->createMock(OrderPaymentRepositoryInterface::class);
         $this->userFacingErrorMapper = $this->createMock(UserFacingErrorMapper::class);
 
         $this->jsonFactory->method('create')->willReturn($this->jsonResult);
         $this->jsonResult->method('setData')->willReturnSelf();
-        $this->curlFactory->method('create')->willReturn($this->curl);
-    }
-
-    public function testTimeoutIsAppliedToCurlBeforePost(): void
-    {
-        $this->primeOrderAndConfig();
-        $this->json->method('serialize')->willReturn('{"request":{}}');
-        $this->json->method('unserialize')->willReturn([
-            'response' => ['response_status' => 'success', 'checkout_url' => 'https://pay.flitt.com/c/x'],
-        ]);
-
-        $this->curl->method('getStatus')->willReturn(200);
-        $this->curl->method('getBody')->willReturn(
-            '{"response":{"response_status":"success","checkout_url":"https://pay.flitt.com/c/x"}}'
-        );
-
-        $callOrder = [];
-        $optionsApplied = [];
-        $this->curl->expects(self::atLeastOnce())
-            ->method('setTimeout')
-            ->willReturnCallback(static function (int $value) use (&$callOrder): void {
-                $callOrder[] = ['setTimeout', $value];
-            });
-        $this->curl->expects(self::atLeastOnce())
-            ->method('setOptions')
-            ->willReturnCallback(static function (array $opts) use (&$callOrder, &$optionsApplied): void {
-                $callOrder[] = ['setOptions', $opts];
-                $optionsApplied = $opts;
-            });
-        $this->curl->expects(self::once())
-            ->method('post')
-            ->willReturnCallback(static function () use (&$callOrder): void {
-                $callOrder[] = ['post'];
-            });
-
-        $controller = $this->makeController();
-        $controller->execute();
-
-        self::assertArrayHasKey(CURLOPT_TIMEOUT, $optionsApplied);
-        self::assertArrayHasKey(CURLOPT_CONNECTTIMEOUT, $optionsApplied);
-        self::assertSame(30, $optionsApplied[CURLOPT_TIMEOUT]);
-        self::assertSame(10, $optionsApplied[CURLOPT_CONNECTTIMEOUT]);
-
-        $postIndex = array_search(['post'], $callOrder, true);
-        self::assertNotFalse($postIndex);
-        $optionsIndex = null;
-        foreach ($callOrder as $i => $call) {
-            if ($call[0] === 'setOptions') {
-                $optionsIndex = $i;
-                break;
-            }
-        }
-        self::assertNotNull($optionsIndex);
-        self::assertLessThan($postIndex, $optionsIndex);
     }
 
     /**
      * Regression for the bug where Redirect was posting to /api/checkout/token (the
      * embed-SDK endpoint that returns only `{token}`) instead of /api/checkout/url
-     * (the redirect endpoint that returns `{checkout_url, payment_id}`). The old
-     * mocks fed back a fake `checkout_url` key so unit tests passed while the real
-     * API responded with empty checkout_url, surfacing as "Unknown error from Flitt
-     * API" in the UI.
+     * (the redirect endpoint that returns `{checkout_url, payment_id}`). The
+     * controller must delegate to the URL endpoint, never the token endpoint, and
+     * must NOT request a retry (URL minting is non-idempotent).
      */
     public function testPostsToCheckoutUrlEndpointNotTokenEndpoint(): void
     {
         $this->primeOrderAndConfig();
-        $this->json->method('serialize')->willReturn('{"request":{}}');
-        $this->json->method('unserialize')->willReturn([
-            'response' => [
-                'response_status' => 'success',
-                'checkout_url'    => 'https://pay.flitt.com/merchants/abc/default/index.html?token=t',
-                'payment_id'      => '12345',
-            ],
-        ]);
-        $this->curl->method('getStatus')->willReturn(200);
-        $this->curl->method('getBody')->willReturn(
-            '{"response":{"response_status":"success","checkout_url":"https://pay.flitt.com/x","payment_id":"12345"}}'
-        );
 
-        $postedUrl = null;
-        $this->curl->expects(self::once())
+        $postedEndpoint = null;
+        $postedRetryable = null;
+        $this->httpClient->expects(self::once())
             ->method('post')
-            ->willReturnCallback(static function (string $url) use (&$postedUrl): void {
-                $postedUrl = $url;
-            });
+            ->willReturnCallback(
+                function (
+                    string $endpoint,
+                    $body,
+                    int $storeId,
+                    bool $retryable = false
+                ) use (
+                    &$postedEndpoint,
+                    &$postedRetryable
+                ): array {
+                    $postedEndpoint = $endpoint;
+                    $postedRetryable = $retryable;
+                    return ['response' => [
+                        'response_status' => 'success',
+                        'checkout_url'    => 'https://pay.flitt.com/x',
+                        'payment_id'      => '12345',
+                    ]];
+                }
+            );
 
         $controller = $this->makeController();
         $controller->execute();
 
-        self::assertSame('https://pay.flitt.com/api/checkout/url', $postedUrl);
-        self::assertStringNotContainsString('/api/checkout/token', (string) $postedUrl);
+        self::assertSame('/api/checkout/url', $postedEndpoint);
+        self::assertFalse($postedRetryable, 'URL minting must NOT be retryable');
     }
 
     /**
      * Regression for the bug where `flitt_order_id` (and `checkout_type`) were
      * set on the payment via `setAdditionalInformation()` but then only
-     * `orderRepository->save($order)` was called. On prod this silently dropped
-     * the keys — ReturnAction then could not match the order Flitt redirected
-     * back for, surfacing as "Payment information not found" + redirect to cart.
-     * Fix: persist the payment explicitly via OrderPaymentRepositoryInterface.
+     * `orderRepository->save($order)` was called. Fix: persist the payment
+     * explicitly via OrderPaymentRepositoryInterface.
      */
     public function testPersistsFlittOrderIdViaPaymentRepository(): void
     {
         $this->primeOrderAndConfig();
-        $this->json->method('serialize')->willReturn('{"request":{}}');
-        $this->json->method('unserialize')->willReturn([
+        $this->httpClient->method('post')->willReturn([
             'response' => [
                 'response_status' => 'success',
                 'checkout_url'    => 'https://pay.flitt.com/x',
                 'payment_id'      => '12345',
             ],
         ]);
-        $this->curl->method('getStatus')->willReturn(200);
-        $this->curl->method('getBody')->willReturn(
-            '{"response":{"response_status":"success","checkout_url":"https://pay.flitt.com/x","payment_id":"12345"}}'
-        );
 
         $this->paymentRepository->expects(self::once())
             ->method('save')
             ->with(self::callback(static function ($payment): bool {
-                // Must be a payment object whose additional_information carries
-                // the flitt_order_id prefix that Redirect.php builds.
                 $info = $payment->getAdditionalInformation('flitt_order_id');
                 return is_string($info) && str_starts_with($info, 'duka_000000042_');
             }));
@@ -197,8 +135,7 @@ class RedirectTest extends TestCase
      * Edge-cases-matrix §5 — double-click Place Order idempotency. If the
      * first invocation already persisted flitt_order_id + checkout_url and
      * the order is fresh, a second POST MUST return the cached URL without
-     * calling Flitt again (no curl->post, no curl->setOptions, no fresh
-     * flitt_order_id overwrite).
+     * calling Flitt again.
      */
     public function testReturnsCachedUrlOnSecondClickIdempotency(): void
     {
@@ -214,8 +151,7 @@ class RedirectTest extends TestCase
         );
 
         // Second click MUST NOT touch Flitt or the payment repository.
-        $this->curl->expects(self::never())->method('post');
-        $this->curl->expects(self::never())->method('setOptions');
+        $this->httpClient->expects(self::never())->method('post');
         $this->paymentRepository->expects(self::never())->method('save');
 
         $captured = null;
@@ -241,8 +177,6 @@ class RedirectTest extends TestCase
      */
     public function testRegeneratesUrlIfCachePastLifetime(): void
     {
-        // created_at 2 hours ago, lifetime is 1 hour (config default) →
-        // cache is stale, controller must call Flitt again.
         $staleCreatedAt = (new \DateTimeImmutable('-2 hours'))->format('Y-m-d H:i:s');
 
         $this->primeOrderAndConfig(
@@ -254,25 +188,20 @@ class RedirectTest extends TestCase
             createdAt: $staleCreatedAt,
         );
 
-        $this->json->method('serialize')->willReturn('{"request":{}}');
-        $this->json->method('unserialize')->willReturn([
-            'response' => [
-                'response_status' => 'success',
-                'checkout_url'    => 'https://pay.flitt.com/fresh',
-                'payment_id'      => '999',
-            ],
-        ]);
-        $this->curl->method('getStatus')->willReturn(200);
-        $this->curl->method('getBody')->willReturn(
-            '{"response":{"response_status":"success","checkout_url":"https://pay.flitt.com/fresh","payment_id":"999"}}'
-        );
-
         // Stale path MUST call Flitt once with a fresh flitt_order_id.
-        $this->curl->expects(self::once())->method('post');
+        $this->httpClient->expects(self::once())
+            ->method('post')
+            ->willReturn([
+                'response' => [
+                    'response_status' => 'success',
+                    'checkout_url'    => 'https://pay.flitt.com/fresh',
+                    'payment_id'      => '999',
+                ],
+            ]);
+
         $this->paymentRepository->expects(self::once())
             ->method('save')
             ->with(self::callback(static function ($payment): bool {
-                // The new flitt_order_id must differ from the stale one.
                 $info = (string) $payment->getAdditionalInformation('flitt_order_id');
                 $checkoutUrl = (string) $payment->getAdditionalInformation('checkout_url');
                 return str_starts_with($info, 'duka_000000042_')
@@ -297,20 +226,17 @@ class RedirectTest extends TestCase
     }
 
     /**
-     * Edge-cases-matrix §4 — when the Flitt token endpoint is unreachable
-     * (curl throws) the controller must attach a visible history comment
-     * on the Magento order so admin can correlate the stuck order to the
-     * outage, then save the order via orderRepository.
+     * Edge-cases-matrix §4 — when the Flitt endpoint is unreachable the
+     * FlittHttpClient throws FlittApiException; the controller must attach a
+     * visible history comment on the Magento order so admin can correlate the
+     * stuck order to the outage, then save the order via orderRepository.
      */
     public function testAddsHistoryCommentOnFlittTimeout(): void
     {
         [$order] = $this->primeOrderAndConfig();
-        $this->json->method('serialize')->willReturn('{"request":{}}');
 
-        // Simulate a curl transport failure (e.g. timeout) — the Magento
-        // Curl wrapper throws a generic \Exception in that situation.
-        $this->curl->method('post')
-            ->willThrowException(new \RuntimeException('cURL error 28: Operation timed out'));
+        $this->httpClient->method('post')
+            ->willThrowException(new FlittApiException(__('Unable to reach the TBC payment gateway.')));
 
         $order->expects(self::once())
             ->method('addCommentToStatusHistory')
@@ -340,14 +266,10 @@ class RedirectTest extends TestCase
     }
 
     /**
-     * Primes the shared mocks (checkoutSession, config, urlBuilder) for a
-     * "fresh" order with an empty payment additional_information map and
-     * returns the payment + order so tests can inspect/seed them.
+     * Primes the shared mocks for a "fresh" order and returns the order + payment.
      *
      * @param array<string, mixed> $preSeededAdditionalInfo seed additional_information
-     *        before the controller runs (e.g. for idempotency short-circuit tests).
-     * @param string|null $createdAt ISO datetime for $order->getCreatedAt(); null
-     *        means "now" (controller will treat the cache as fresh).
+     * @param string|null $createdAt ISO datetime for $order->getCreatedAt(); null = now
      * @return array{0: Order&MockObject, 1: Payment&MockObject}
      */
     private function primeOrderAndConfig(
@@ -402,7 +324,7 @@ class RedirectTest extends TestCase
         $this->config->method('isDebugEnabled')->willReturn(false);
 
         $this->urlBuilder->method('getUrl')->willReturn('https://duka.ge/cb');
-        $this->localeResolver->method('getLocale')->willReturn('en_US');
+        $this->languageResolver->method('resolve')->willReturn('en');
 
         return [$order, $payment];
     }
@@ -415,9 +337,8 @@ class RedirectTest extends TestCase
             config: $this->config,
             urlBuilder: $this->urlBuilder,
             logger: $this->logger,
-            curlFactory: $this->curlFactory,
-            json: $this->json,
-            localeResolver: $this->localeResolver,
+            httpClient: $this->httpClient,
+            languageResolver: $this->languageResolver,
             paymentRepository: $this->paymentRepository,
             userFacingErrorMapper: $this->userFacingErrorMapper,
             orderRepository: $this->orderRepository,

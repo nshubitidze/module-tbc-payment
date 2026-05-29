@@ -9,14 +9,13 @@ use Magento\Framework\App\Action\HttpPostActionInterface;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\Controller\ResultInterface;
 use Magento\Framework\Exception\LocalizedException;
-use Magento\Framework\HTTP\Client\CurlFactory;
-use Magento\Framework\Serialize\Serializer\Json;
-use Magento\Framework\Locale\ResolverInterface;
 use Magento\Framework\UrlInterface;
 use Magento\Quote\Api\CartRepositoryInterface;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
+use Shubo\TbcPayment\Gateway\Http\Client\FlittHttpClient;
+use Shubo\TbcPayment\Service\FlittLanguageResolver;
 
 /**
  * AJAX endpoint that obtains a Flitt checkout token for the active quote.
@@ -34,9 +33,8 @@ class Params implements HttpPostActionInterface
         private readonly Config $config,
         private readonly UrlInterface $urlBuilder,
         private readonly LoggerInterface $logger,
-        private readonly CurlFactory $curlFactory,
-        private readonly Json $json,
-        private readonly ResolverInterface $localeResolver,
+        private readonly FlittHttpClient $httpClient,
+        private readonly FlittLanguageResolver $languageResolver,
         private readonly UserFacingErrorMapper $userFacingErrorMapper,
     ) {
     }
@@ -92,7 +90,7 @@ class Params implements HttpPostActionInterface
                 'amount' => $amount,
                 'currency' => $currency,
                 'sender_email' => $senderEmail,
-                'lang' => $this->resolveLanguage(),
+                'lang' => $this->languageResolver->resolve(),
                 'response_url' => $this->urlBuilder->getUrl(
                     'checkout/onepage/success',
                     ['_nosid' => true],
@@ -112,7 +110,7 @@ class Params implements HttpPostActionInterface
 
             $params['signature'] = Config::generateSignature($params, $password);
 
-            $token = $this->requestCheckoutToken($apiUrl, $params, $storeId);
+            $token = $this->requestCheckoutToken($params, $storeId);
 
             // Store flitt_order_id on quote payment so it carries over to the order.
             // The cron reconciler and refund builder need this to reference the Flitt order.
@@ -152,47 +150,29 @@ class Params implements HttpPostActionInterface
     /**
      * Exchange signed params for a Flitt checkout token via the API.
      *
+     * Transport (curl/timeouts/connect-timeout/non-2xx handling) is delegated to
+     * {@see FlittHttpClient}; this method retains only the Flitt response-status
+     * inspection and friendly-error mapping. Token minting is non-idempotent, so
+     * the call is NOT retried.
+     *
      * @param array<string, mixed> $params Signed payment parameters
      * @throws LocalizedException When the API call fails or returns an error
      */
-    private function requestCheckoutToken(string $apiUrl, array $params, int $storeId): string
+    private function requestCheckoutToken(array $params, int $storeId): string
     {
-        $tokenUrl = $apiUrl . '/api/checkout/token';
-        $requestBody = $this->json->serialize(['request' => $params]);
-
-        $curl = $this->curlFactory->create();
-        $curl->addHeader('Content-Type', 'application/json');
-        // Bound the API call so a hung Flitt token endpoint cannot exhaust PHP workers.
-        $curl->setTimeout(30);
-        $curl->setOptions([
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_CONNECTTIMEOUT => 10,
-        ]);
-        $curl->post($tokenUrl, (string) $requestBody);
-
-        $responseBody = $curl->getBody();
-        $httpStatus = $curl->getStatus();
-
         if ($this->config->isDebugEnabled($storeId)) {
             $this->logger->debug('TBC token API request', [
-                'url' => $tokenUrl,
+                'endpoint' => '/api/checkout/token',
                 'params' => array_diff_key($params, ['signature' => true]),
             ]);
-            $this->logger->debug('TBC token API response', [
-                'http_status' => $httpStatus,
-                'body' => $responseBody,
-            ]);
         }
 
-        if ($httpStatus < 200 || $httpStatus >= 300) {
-            throw new LocalizedException(
-                __('Flitt API returned HTTP %1.', $httpStatus),
-            );
-        }
+        // FlittApiException extends LocalizedException; a non-2xx HTTP status
+        // therefore surfaces through the controller's catch (LocalizedException)
+        // block exactly as the previous inline implementation did.
+        $responseData = $this->httpClient->post('/api/checkout/token', ['request' => $params], $storeId);
 
         /** @var array{response?: array{response_status?: string, token?: string, error_message?: string}} $responseData */
-        $responseData = $this->json->unserialize($responseBody);
-
         $response = $responseData['response'] ?? [];
         $status = $response['response_status'] ?? '';
         $token = $response['token'] ?? '';
@@ -223,20 +203,5 @@ class Params implements HttpPostActionInterface
         }
 
         return $token;
-    }
-
-    /**
-     * Map current store locale to a Flitt-supported language code.
-     */
-    private function resolveLanguage(): string
-    {
-        $locale = $this->localeResolver->getLocale();
-        $language = substr($locale, 0, 2);
-
-        return match ($language) {
-            'ka' => 'ka',
-            'ru' => 'ru',
-            default => 'en',
-        };
     }
 }

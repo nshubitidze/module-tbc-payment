@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Shubo\TbcPayment\Controller\Payment;
 
 use Magento\Checkout\Model\Session as CheckoutSession;
-use Magento\Framework\Api\SearchCriteriaBuilder;
 use Magento\Framework\App\Action\HttpGetActionInterface;
 use Magento\Framework\App\Action\HttpPostActionInterface;
 use Magento\Framework\App\CsrfAwareActionInterface;
@@ -18,12 +17,15 @@ use Magento\Framework\Controller\ResultInterface;
 use Magento\Framework\Message\ManagerInterface as MessageManager;
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
-use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
-use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
-use Shubo\TbcPayment\Gateway\Response\PaymentInfoKeys;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
+use Shubo\TbcPayment\Model\FlittStatus;
+use Shubo\TbcPayment\Model\OrderLocator;
+use Shubo\TbcPayment\Service\ApprovalContext;
+use Shubo\TbcPayment\Service\ApprovalResult;
+use Shubo\TbcPayment\Service\OrderApprovalApplier;
+use Shubo\TbcPayment\Service\PaymentLock;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -38,32 +40,20 @@ use Shubo\TbcPayment\Service\SettlementService;
  */
 class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, CsrfAwareActionInterface
 {
-    /**
-     * @param \Magento\Framework\App\Request\Http $request
-     * @param RedirectFactory $redirectFactory
-     * @param CheckoutSession $checkoutSession
-     * @param OrderRepositoryInterface $orderRepository
-     * @param SearchCriteriaBuilder $searchCriteriaBuilder
-     * @param StatusClient $statusClient
-     * @param CallbackValidator $callbackValidator
-     * @param SettlementService $settlementService
-     * @param MessageManager $messageManager
-     * @param Config $config
-     * @param LoggerInterface $logger
-     */
     public function __construct(
         private readonly \Magento\Framework\App\Request\Http $request,
         private readonly RedirectFactory $redirectFactory,
         private readonly CheckoutSession $checkoutSession,
         private readonly OrderRepositoryInterface $orderRepository,
-        private readonly SearchCriteriaBuilder $searchCriteriaBuilder,
+        private readonly OrderLocator $orderLocator,
         private readonly StatusClient $statusClient,
         private readonly CallbackValidator $callbackValidator,
+        private readonly OrderApprovalApplier $approvalApplier,
         private readonly SettlementService $settlementService,
         private readonly MessageManager $messageManager,
-        private readonly Config $config,
         private readonly LoggerInterface $logger,
         private readonly ResourceConnection $resourceConnection,
+        private readonly PaymentLock $paymentLock,
     ) {
     }
 
@@ -107,7 +97,8 @@ class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, C
                 return $redirect->setPath('checkout/cart');
             }
 
-            $order = $this->findOrderByFlittId($flittOrderId);
+            /** @var Order|null $order */
+            $order = $this->orderLocator->byFlittOrderId($flittOrderId);
 
             if ($order === null) {
                 $this->logger->error('TBC Return: order not found for Flitt ID', [
@@ -127,9 +118,9 @@ class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, C
 
             $storeId = (int) $order->getStoreId();
 
-            // NEVER trust GET params — verify via Flitt Status API
-            $response = $this->statusClient->checkStatus($flittOrderId, $storeId);
-            $responseData = $response['response'] ?? $response;
+            // NEVER trust GET params — verify via Flitt Status API.
+            // StatusClient::checkStatus already unwraps the Flitt `response` envelope.
+            $responseData = $this->statusClient->checkStatus($flittOrderId, $storeId);
             $flittStatus = (string) ($responseData['order_status'] ?? '');
 
             $this->logger->info('TBC Return: Flitt status check', [
@@ -138,11 +129,11 @@ class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, C
                 'flitt_status'   => $flittStatus,
             ]);
 
-            if ($flittStatus === 'approved') {
+            if ($flittStatus === FlittStatus::APPROVED) {
                 return $this->handleApproved($order, $responseData, $redirect);
             }
 
-            if ($flittStatus === 'processing' || $flittStatus === 'created') {
+            if ($flittStatus === FlittStatus::PROCESSING || $flittStatus === FlittStatus::CREATED) {
                 // Payment still in progress — do NOT redirect to the success
                 // page (misleading if the bank ultimately declines).
                 // Callback + PendingOrderReconciler will finalise asynchronously
@@ -173,8 +164,11 @@ class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, C
     /**
      * Handle an approved Flitt payment: validate signature, update order, trigger settlement.
      *
-     * Runs the order/invoice mutation under a row lock + DB transaction so a
-     * concurrent Callback or PendingOrderReconciler invocation can't double-invoice.
+     * Runs the order/invoice mutation under a {@see PaymentLock} (IMPROVE-2) AND
+     * a row lock + DB transaction so a concurrent Callback / Confirm / Cron
+     * invocation can't double-invoice. On lock contention another handler is
+     * already finalising the order, so we still redirect to success (the
+     * customer paid; the order is being completed elsewhere).
      *
      * @param Order $order
      * @param array<string, mixed> $responseData Flitt status API response payload
@@ -197,15 +191,56 @@ class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, C
             return $redirect->setPath('checkout/onepage/failure');
         }
 
+        $flittOrderId = (string) ($responseData['order_id'] ?? '');
+        // Lock key: prefer the Flitt order_id; fall back to the increment_id so
+        // the key never goes empty (withLock throws on an empty key).
+        $lockKey = $flittOrderId !== '' ? $flittOrderId : (string) $order->getIncrementId();
+
+        $outcome = $this->paymentLock->withLock(
+            $lockKey,
+            fn (): string => $this->approveUnderRowLock($order, $responseData)
+        );
+
+        if ($outcome === null) {
+            // Contention — a concurrent handler holds the lock. The customer
+            // paid; that handler is finalising the order. Stamp session data
+            // from a fresh read so the success page renders, and redirect.
+            /** @var Order $freshOrder */
+            $freshOrder = $this->orderRepository->get((int) $order->getEntityId());
+            $this->setCheckoutSessionData($freshOrder);
+            $this->logger->info('TBC Return: lock contended, another handler finalising', [
+                'order_id' => $order->getIncrementId(),
+            ]);
+            return $redirect->setPath('checkout/onepage/success');
+        }
+
+        if ($outcome === 'failure') {
+            return $redirect->setPath('checkout/onepage/failure');
+        }
+
+        return $redirect->setPath('checkout/onepage/success');
+    }
+
+    /**
+     * Acquire the row lock, re-check state, apply the approval, and run
+     * settlement. Runs while holding the PaymentLock (set in handleApproved).
+     *
+     * @param array<string, mixed> $responseData
+     * @return string 'success' or 'failure' (drives the redirect in the caller)
+     */
+    private function approveUnderRowLock(Order $order, array $responseData): string
+    {
         $connection = $this->resourceConnection->getConnection();
         $connection->beginTransaction();
 
         $paymentId = (string) ($responseData['payment_id'] ?? '');
         $processedOrder = null;
+        $captured = false;
 
         try {
             // Row-level lock so concurrent Callback/Confirm/Cron cannot also
-            // create an invoice for this order.
+            // create an invoice for this order (belt-and-suspenders under the
+            // advisory lock).
             $orderTable = $this->resourceConnection->getTableName('sales_order');
             $select = $connection->select()
                 ->from($orderTable, ['entity_id', 'state'])
@@ -218,7 +253,7 @@ class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, C
                 $this->logger->warning('TBC Return: order row vanished under lock', [
                     'order_id' => $order->getIncrementId(),
                 ]);
-                return $redirect->setPath('checkout/onepage/failure');
+                return 'failure';
             }
 
             // Re-load to get an up-to-date snapshot inside the locked region.
@@ -235,67 +270,53 @@ class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, C
                 $this->logger->info('TBC Return: already processed by concurrent path', [
                     'order_id' => $freshOrder->getIncrementId(),
                 ]);
-                return $redirect->setPath('checkout/onepage/success');
+                return 'success';
             }
 
-            /** @var Payment $payment */
-            $payment = $freshOrder->getPayment();
+            // Apply the shared approve mutation (in-memory only); the row lock,
+            // txn and save boundary stays here in the controller.
+            $applyResult = $this->approvalApplier->apply($freshOrder, $responseData, ApprovalContext::Redirect);
 
-            $this->storePaymentDetails($payment, $responseData);
-
-            if ($paymentId !== '') {
-                // NOTE: We intentionally do NOT call setParentTransactionId() here.
-                // In direct-sale (non-preauth) mode there is no auth transaction upstream
-                // that the capture could point at, and inventing a synthetic
-                // "{increment_id}-auth" parent_txn_id produced dangling parent links in the
-                // admin transaction tree. When preauth capture is implemented as a
-                // distinct workflow, reintroduce the parent pointer from a REAL auth row.
-                $payment->setTransactionId($paymentId);
-            }
-
-            if ($this->config->isPreauth($storeId)) {
-                $payment->setAdditionalInformation('preauth_approved', true);
-                $payment->setIsTransactionPending(false);
-                $payment->setIsTransactionClosed(false);
-                $freshOrder->setState(Order::STATE_PROCESSING);
-                $freshOrder->setStatus(Order::STATE_PROCESSING);
-                $freshOrder->addCommentToStatusHistory(
-                    (string) __(
-                        'Funds held by TBC Bank (redirect). Payment ID: %1. Use "Capture Payment" to charge.',
-                        $paymentId
-                    )
+            // IMPROVE-8: a refused capture (amount mismatch) means the cart was
+            // re-priced mid-flow. Roll back, leave the order for admin reconcile,
+            // and send the customer to failure rather than confirm a wrong total.
+            if ($applyResult === ApprovalResult::RefusedAmountMismatch) {
+                $connection->rollBack();
+                $this->logger->error('TBC Return: capture refused (amount mismatch), left for admin reconcile', [
+                    'order_id' => $freshOrder->getIncrementId(),
+                ]);
+                $this->messageManager->addErrorMessage(
+                    (string) __('Payment verification failed. Please contact support.')
                 );
-            } else {
-                $amountMinor = (int) ($responseData['amount']
-                    ?? (int) round($freshOrder->getGrandTotal() * 100));
-                $payment->setIsTransactionPending(false);
-                $payment->setIsTransactionClosed(true);
-                $payment->registerCaptureNotification($amountMinor / 100);
-                $freshOrder->setState(Order::STATE_PROCESSING);
-                $freshOrder->setStatus(Order::STATE_PROCESSING);
-                $freshOrder->addCommentToStatusHistory(
-                    (string) __('Payment approved by TBC Bank (redirect). Payment ID: %1', $paymentId)
-                );
+                return 'failure';
             }
 
             $this->orderRepository->save($freshOrder);
             $connection->commit();
             $processedOrder = $freshOrder;
+            $captured = $applyResult === ApprovalResult::Captured;
         } catch (\Exception $e) {
             $connection->rollBack();
             throw $e;
         }
 
         // Settlement runs OUTSIDE the order transaction so it never holds the
-        // row lock during an external HTTP call.
-        try {
-            $this->settlementService->settle($processedOrder);
-            $this->orderRepository->save($processedOrder);
-        } catch (\Exception $e) {
-            $this->logger->error('TBC Return: settlement failed', [
-                'order_id' => $processedOrder->getIncrementId(),
-                'error'    => $e->getMessage(),
-            ]);
+        // row lock during an external HTTP call. Gate it on a GENUINE capture:
+        // on a preauth-held result the funds are only HELD, so settling now
+        // would distribute the full amount to sub-merchant receivers before
+        // capture. This unifies ReturnAction with the other four capture paths,
+        // which all settle only on ApprovalResult::Captured. The customer still
+        // reaches the success page either way (their payment was approved/held).
+        if ($captured) {
+            try {
+                $this->settlementService->settle($processedOrder);
+                $this->orderRepository->save($processedOrder);
+            } catch (\Exception $e) {
+                $this->logger->error('TBC Return: settlement failed', [
+                    'order_id' => $processedOrder->getIncrementId(),
+                    'error'    => $e->getMessage(),
+                ]);
+            }
         }
 
         $this->setCheckoutSessionData($processedOrder);
@@ -303,9 +324,10 @@ class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, C
         $this->logger->info('TBC Return: order approved', [
             'order_id'   => $processedOrder->getIncrementId(),
             'payment_id' => $paymentId,
+            'result'     => $applyResult->name,
         ]);
 
-        return $redirect->setPath('checkout/onepage/success');
+        return 'success';
     }
 
     /**
@@ -337,72 +359,6 @@ class ReturnAction implements HttpGetActionInterface, HttpPostActionInterface, C
             (string) __('Payment was not completed. Please try again.')
         );
         return $redirect->setPath('checkout');
-    }
-
-    /**
-     * Find the Magento order matching a Flitt order ID.
-     *
-     * Flitt order ID format: duka_{incrementId}_{timestamp}
-     * We extract the increment ID, load the order, then verify the stored
-     * flitt_order_id on the payment matches — guards against timing collisions.
-     *
-     * @param string $flittOrderId
-     */
-    private function findOrderByFlittId(string $flittOrderId): ?Order
-    {
-        if (!preg_match('/^duka_(.+)_\d+$/', $flittOrderId, $matches)) {
-            $this->logger->warning('TBC Return: unrecognised Flitt order ID format', [
-                'flitt_order_id' => $flittOrderId,
-            ]);
-            return null;
-        }
-
-        $incrementId = $matches[1];
-
-        $searchCriteria = $this->searchCriteriaBuilder
-            ->addFilter('increment_id', $incrementId)
-            ->setPageSize(1)
-            ->create();
-
-        $orders = $this->orderRepository->getList($searchCriteria)->getItems();
-
-        /** @var Order|null $order */
-        $order = reset($orders) ?: null;
-
-        if ($order === null) {
-            return null;
-        }
-
-        // Confirm the stored Flitt order ID matches — prevents cross-order collisions
-        /** @var Payment|null $payment */
-        $payment = $order->getPayment();
-        if ($payment === null) {
-            return null;
-        }
-
-        $storedFlittId = (string) $payment->getAdditionalInformation('flitt_order_id');
-        if ($storedFlittId !== $flittOrderId) {
-            $this->logger->warning('TBC Return: flitt_order_id mismatch on payment', [
-                'flitt_order_id' => $flittOrderId,
-                'stored'         => $storedFlittId,
-                'order_id'       => $order->getIncrementId(),
-            ]);
-            return null;
-        }
-
-        return $order;
-    }
-
-    /**
-     * Persist Flitt payment details onto the order payment additional info.
-     *
-     * @param Payment $payment
-     * @param array<string, mixed> $responseData Flitt status API response payload
-     */
-    private function storePaymentDetails(Payment $payment, array $responseData): void
-    {
-        PaymentInfoKeys::apply($payment, $responseData);
-        $payment->setAdditionalInformation('awaiting_flitt_confirmation', false);
     }
 
     /**

@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace Shubo\TbcPayment\Gateway\Http\Client;
 
-use Magento\Framework\HTTP\Client\CurlFactory;
-use Magento\Framework\Serialize\Serializer\Json;
 use Magento\Payment\Gateway\Http\ClientInterface;
 use Magento\Payment\Gateway\Http\TransferInterface;
 use Psr\Log\LoggerInterface;
@@ -14,6 +12,14 @@ use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
 
 /**
  * HTTP client for Flitt refund/reverse operations.
+ *
+ * Stays on the Magento gateway pipeline (implements ClientInterface) and keeps
+ * unpacking the store id + body from the TransferObject and wrapping the
+ * {"request": ...} envelope itself; only the curl transport is delegated to
+ * {@see FlittHttpClient}.
+ *
+ * Refund is non-idempotent (a retried refund double-refunds), so it never passes
+ * retryable = true.
  */
 class RefundClient implements ClientInterface
 {
@@ -21,8 +27,7 @@ class RefundClient implements ClientInterface
 
     public function __construct(
         private readonly Config $config,
-        private readonly CurlFactory $curlFactory,
-        private readonly Json $json,
+        private readonly FlittHttpClient $httpClient,
         private readonly LoggerInterface $logger,
     ) {
     }
@@ -35,60 +40,18 @@ class RefundClient implements ClientInterface
     public function placeRequest(TransferInterface $transferObject): array
     {
         $requestBody = $transferObject->getBody();
-        $storeId = $requestBody['__store_id'] ?? null;
+        $storeId = (int) ($requestBody['__store_id'] ?? 0);
         unset($requestBody['__store_id']);
-
-        // Flitt reverse endpoint uses the order_id in the URL path
-        $url = $this->config->getApiUrl($storeId) . self::ENDPOINT;
 
         if ($this->config->isDebugEnabled($storeId)) {
             $this->logger->debug('Flitt Refund request', [
-                'url' => $url,
+                'endpoint' => self::ENDPOINT,
                 'params' => $this->sanitizeForLog($requestBody),
             ]);
         }
 
-        try {
-            $curl = $this->curlFactory->create();
-            $curl->addHeader('Content-Type', 'application/json');
-            $curl->setOptions([CURLOPT_TIMEOUT => 30]);
-            // Flitt expects the body wrapped in {"request": {...}}
-            $curl->post($url, (string) $this->json->serialize(['request' => $requestBody]));
-
-            $responseBody = $curl->getBody();
-            $statusCode = $curl->getStatus();
-
-            if ($this->config->isDebugEnabled($storeId)) {
-                $this->logger->debug('Flitt Refund response', [
-                    'status' => $statusCode,
-                    'body' => $responseBody,
-                ]);
-            }
-
-            if ($statusCode < 200 || $statusCode >= 300) {
-                throw new FlittApiException(
-                    __('Flitt refund API returned HTTP %1', $statusCode)
-                );
-            }
-
-            $response = $this->json->unserialize($responseBody);
-
-            if (!is_array($response)) {
-                throw new FlittApiException(__('Invalid refund response from Flitt API'));
-            }
-
-            return $response;
-        } catch (FlittApiException $e) {
-            throw $e;
-        } catch (\Exception $e) {
-            $this->logger->error('Flitt Refund error: ' . $e->getMessage(), [
-                'exception' => $e,
-            ]);
-            throw new FlittApiException(
-                __('Unable to process refund via TBC payment gateway. Please try again.'),
-                $e
-            );
-        }
+        // Flitt expects the body wrapped in {"request": {...}}.
+        return $this->httpClient->post(self::ENDPOINT, ['request' => $requestBody], $storeId);
     }
 
     /**

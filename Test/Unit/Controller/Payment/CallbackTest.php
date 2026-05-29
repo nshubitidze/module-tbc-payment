@@ -4,15 +4,12 @@ declare(strict_types=1);
 
 namespace Shubo\TbcPayment\Test\Unit\Controller\Payment;
 
-use Magento\Framework\Api\SearchCriteria;
-use Magento\Framework\Api\SearchCriteriaBuilder;
 use Magento\Framework\App\Request\Http as HttpRequest;
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\Controller\Result\Json as JsonResult;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\DB\Adapter\AdapterInterface;
 use Magento\Framework\Serialize\Serializer\Json;
-use Magento\Sales\Api\Data\OrderSearchResultInterface;
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
@@ -23,6 +20,9 @@ use Shubo\TbcPayment\Controller\Payment\Callback;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
+use Shubo\TbcPayment\Model\OrderLocator;
+use Shubo\TbcPayment\Service\OrderApprovalApplier;
+use Shubo\TbcPayment\Service\PaymentLock;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -42,15 +42,17 @@ class CallbackTest extends TestCase
     private JsonFactory&MockObject $jsonFactory;
     private Json&MockObject $jsonSerializer;
     private OrderRepositoryInterface&MockObject $orderRepository;
-    private SearchCriteriaBuilder&MockObject $searchCriteriaBuilder;
+    private OrderLocator&MockObject $orderLocator;
     private CallbackValidator&MockObject $callbackValidator;
+    private OrderApprovalApplier&MockObject $approvalApplier;
     private SettlementService&MockObject $settlementService;
-    private Config&MockObject $config;
     private LoggerInterface&MockObject $logger;
     private ResourceConnection&MockObject $resourceConnection;
     private AdapterInterface&MockObject $connection;
     private JsonResult&MockObject $jsonResult;
     private UserFacingErrorMapper&MockObject $userFacingErrorMapper;
+    private PaymentLock&MockObject $paymentLock;
+    private Config&MockObject $config;
 
     /** @var list<string> */
     private array $comments = [];
@@ -66,15 +68,17 @@ class CallbackTest extends TestCase
         $this->jsonFactory          = $this->createMock(JsonFactory::class);
         $this->jsonSerializer       = $this->createMock(Json::class);
         $this->orderRepository      = $this->createMock(OrderRepositoryInterface::class);
-        $this->searchCriteriaBuilder = $this->createMock(SearchCriteriaBuilder::class);
+        $this->orderLocator         = $this->createMock(OrderLocator::class);
         $this->callbackValidator    = $this->createMock(CallbackValidator::class);
+        $this->approvalApplier      = $this->createMock(OrderApprovalApplier::class);
         $this->settlementService    = $this->createMock(SettlementService::class);
-        $this->config               = $this->createMock(Config::class);
         $this->logger               = $this->createMock(LoggerInterface::class);
         $this->resourceConnection   = $this->createMock(ResourceConnection::class);
         $this->connection           = $this->createMock(AdapterInterface::class);
         $this->jsonResult           = $this->createMock(JsonResult::class);
         $this->userFacingErrorMapper = $this->createMock(UserFacingErrorMapper::class);
+        $this->paymentLock          = $this->createMock(PaymentLock::class);
+        $this->config               = $this->createMock(Config::class);
 
         $this->jsonFactory->method('create')->willReturn($this->jsonResult);
         $this->jsonResult->method('setData')->willReturnSelf();
@@ -83,6 +87,15 @@ class CallbackTest extends TestCase
         $this->resourceConnection->method('getConnection')->willReturn($this->connection);
 
         $this->callbackValidator->method('validate')->willReturn(true);
+
+        // Empty allowlist → all source IPs allowed (fail-open default).
+        $this->config->method('getCallbackIpAllowlist')->willReturn([]);
+
+        // PaymentLock under test here just runs the wrapped callable (the lock
+        // is acquired). Concurrency-contention behaviour is covered separately.
+        $this->paymentLock->method('withLock')->willReturnCallback(
+            static fn (string $key, callable $cb): mixed => $cb()
+        );
 
         // Settlement must never be invoked on the reversed branch.
         $this->settlementService->expects(self::never())->method('settle');
@@ -297,13 +310,49 @@ class CallbackTest extends TestCase
     }
 
     /**
+     * Finding #1 (MUST-FIX) — a bank/fraud REVERSAL re-uses the captured
+     * payment_id. The replay guard stamps flitt_processed_payment_id on capture;
+     * if the guard short-circuited every matching payment_id it would 200-no-op
+     * this reversal and handleReversed() (which closes the order) would never
+     * run. Because the short-circuit is scoped to APPROVED status only, a
+     * reversed callback carrying the SAME payment_id still routes to
+     * handleReversed and the PROCESSING order transitions to CLOSED.
+     */
+    public function testReversedWithMatchingStoredPaymentIdStillClosesOrder(): void
+    {
+        $order = $this->primeOrder(
+            state: Order::STATE_PROCESSING,
+            grandTotal: 10.50,
+            callbackData: ['reverse_amount' => 1050, 'payment_id' => 'pay-cap-1'],
+            // The captured payment_id was stamped on this order on capture.
+            processedPaymentId: 'pay-cap-1',
+        );
+
+        $this->buildController()->execute();
+
+        self::assertSame(
+            [[Order::STATE_CLOSED, Order::STATE_CLOSED]],
+            $this->stateTransitions,
+            'A reversed callback with a matching stored payment_id must NOT be '
+            . 'treated as a replay; handleReversed must close the order.'
+        );
+        self::assertNotEmpty($this->comments);
+        self::assertStringContainsString('Order closed', $this->comments[0]);
+        unset($order);
+    }
+
+    /**
      * Build an order mock + wire all framework mocks so a canned reversed
      * callback payload routes through the controller.
      *
      * @param array<string, mixed> $callbackData
      */
-    private function primeOrder(string $state, float $grandTotal, array $callbackData): Order&MockObject
-    {
+    private function primeOrder(
+        string $state,
+        float $grandTotal,
+        array $callbackData,
+        string $processedPaymentId = '',
+    ): Order&MockObject {
         $callbackData += [
             'order_id' => 'duka_000000042_1234',
             'order_status' => 'reversed',
@@ -316,6 +365,15 @@ class CallbackTest extends TestCase
         $payment = $this->createMock(Payment::class);
         $payment->method('setAdditionalInformation')->willReturnSelf();
         $payment->method('setTransactionId')->willReturnSelf();
+        // Stored processed payment_id: empty by default (replay guard inert);
+        // a non-empty value simulates a capture having stamped it, used by the
+        // reversal-with-matching-id regression (finding #1).
+        $payment->method('getAdditionalInformation')->willReturnCallback(
+            static fn (?string $key = null): mixed
+                => $key === 'flitt_processed_payment_id' && $processedPaymentId !== ''
+                    ? $processedPaymentId
+                    : null
+        );
 
         $order = $this->createMock(Order::class);
         $order->method('getPayment')->willReturn($payment);
@@ -356,14 +414,18 @@ class CallbackTest extends TestCase
             }
         );
 
-        $searchResult = $this->createMock(OrderSearchResultInterface::class);
-        $searchResult->method('getItems')->willReturn([$order]);
-
-        $searchCriteria = $this->createMock(SearchCriteria::class);
-        $this->searchCriteriaBuilder->method('addFilter')->willReturnSelf();
-        $this->searchCriteriaBuilder->method('setPageSize')->willReturnSelf();
-        $this->searchCriteriaBuilder->method('create')->willReturn($searchCriteria);
-        $this->orderRepository->method('getList')->willReturn($searchResult);
+        // The controller resolves the order via OrderLocator now (was the inline
+        // SearchCriteriaBuilder getList lookup). extractIncrementId strips the
+        // duka_ prefix; byIncrementId returns the order (called twice — once
+        // pre-transaction, once on the in-transaction reload).
+        $this->orderLocator->method('extractIncrementId')
+            ->willReturnCallback(static function (string $flittOrderId): string {
+                if (preg_match('/^duka_(.+)_\d+$/', $flittOrderId, $matches)) {
+                    return $matches[1];
+                }
+                return $flittOrderId;
+            });
+        $this->orderLocator->method('byIncrementId')->willReturn($order);
 
         return $order;
     }
@@ -375,13 +437,15 @@ class CallbackTest extends TestCase
             $this->jsonFactory,
             $this->jsonSerializer,
             $this->orderRepository,
-            $this->searchCriteriaBuilder,
+            $this->orderLocator,
             $this->callbackValidator,
+            $this->approvalApplier,
             $this->settlementService,
-            $this->config,
             $this->logger,
             $this->resourceConnection,
             $this->userFacingErrorMapper,
+            $this->paymentLock,
+            $this->config,
         );
     }
 }

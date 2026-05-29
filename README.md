@@ -309,17 +309,13 @@ The following buttons appear on the order view page for TBC-paid orders:
 | Class | Purpose |
 |---|---|
 | `Gateway\Config\Config` | Configuration reader with typed accessors; signature generation |
-| `Gateway\Http\Client\CreatePaymentClient` | Requests checkout tokens from Flitt `/api/checkout/token` |
 | `Gateway\Http\Client\RefundClient` | Sends refund requests to Flitt `/api/reverse/order_id` |
 | `Gateway\Http\Client\CaptureClient` | Captures pre-authorized payments via `/api/capture/order_id` |
 | `Gateway\Http\Client\StatusClient` | Checks payment status via `/api/status/order_id` |
 | `Gateway\Http\Client\SettlementClient` | Distributes funds via `/api/settlement` |
-| `Gateway\Request\InitializeRequestBuilder` | Builds the checkout token request payload |
 | `Gateway\Request\RefundRequestBuilder` | Builds the refund request payload |
-| `Gateway\Request\SplitDataBuilder` | Adds split receiver data to the initialize request |
-| `Gateway\Response\InitializeHandler` | Stores the Flitt token on the payment object |
+| `Gateway\Request\SplitDataBuilder` | Adds split receiver data to the settlement request (kept; not wired into a command pool) |
 | `Gateway\Response\RefundHandler` | Processes refund response, stores refund status |
-| `Gateway\Validator\ResponseValidator` | Validates Flitt API `response_status` |
 | `Gateway\Validator\CallbackValidator` | Verifies SHA1 callback signatures |
 | `Controller\Payment\Params` | AJAX endpoint returning the Flitt checkout token |
 | `Controller\Payment\Callback` | Server-to-server callback from Flitt |
@@ -336,11 +332,15 @@ The following buttons appear on the order view page for TBC-paid orders:
 The module uses Magento's Payment Gateway framework with virtual types:
 
 - **Facade**: `ShuboTbcPaymentFacade` (virtual type of `Magento\Payment\Model\Method\Adapter`)
-- **Command Pool**: `initialize` and `refund` commands
-- **Request Builders**: Composite builder with `InitializeRequestBuilder` + `SplitDataBuilder`
+- **Command Pool**: a single `refund` command. Checkout-token creation, capture,
+  status checks and settlement run through standalone clients
+  (`CaptureClient`, `StatusClient`, `SettlementClient`) and the controllers, not
+  the command pool.
+- **Request Builders**: `RefundRequestBuilder` (refund payload). `SplitDataBuilder`
+  is retained for split-receiver data but is not currently wired into a command pool.
 - **HTTP Clients**: Direct cURL calls to the Flitt REST API
-- **Response Handlers**: Store tokens, transaction IDs, and refund status
-- **Validators**: `ResponseValidator` for API responses, `CallbackValidator` for signatures
+- **Response Handlers**: `RefundHandler` stores refund status
+- **Validators**: `CallbackValidator` verifies SHA1 callback/status signatures
 
 ### Events Dispatched
 

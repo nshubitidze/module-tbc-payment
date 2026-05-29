@@ -50,29 +50,7 @@
     <virtualType name="ShuboTbcCommandPool" type="Magento\Payment\Gateway\Command\CommandPool">
         <arguments>
             <argument name="commands" xsi:type="array">
-                <item name="initialize" xsi:type="string">ShuboTbcInitializeCommand</item>
                 <item name="refund" xsi:type="string">ShuboTbcRefundCommand</item>
-            </argument>
-        </arguments>
-    </virtualType>
-
-    <!-- Initialize Command (create Flitt checkout token) -->
-    <virtualType name="ShuboTbcInitializeCommand" type="Magento\Payment\Gateway\Command\GatewayCommand">
-        <arguments>
-            <argument name="requestBuilder" xsi:type="object">ShuboTbcInitializeRequest</argument>
-            <argument name="transferFactory" xsi:type="object">Shubo\TbcPayment\Gateway\Http\TransferFactory</argument>
-            <argument name="client" xsi:type="object">Shubo\TbcPayment\Gateway\Http\Client\CreatePaymentClient</argument>
-            <argument name="handler" xsi:type="object">Shubo\TbcPayment\Gateway\Response\InitializeHandler</argument>
-            <argument name="validator" xsi:type="object">Shubo\TbcPayment\Gateway\Validator\ResponseValidator</argument>
-        </arguments>
-    </virtualType>
-
-    <!-- Initialize Request Builder Composite -->
-    <virtualType name="ShuboTbcInitializeRequest" type="Magento\Payment\Gateway\Request\BuilderComposite">
-        <arguments>
-            <argument name="builders" xsi:type="array">
-                <item name="initialize" xsi:type="string">Shubo\TbcPayment\Gateway\Request\InitializeRequestBuilder</item>
-                <item name="split_data" xsi:type="string">Shubo\TbcPayment\Gateway\Request\SplitDataBuilder</item>
             </argument>
         </arguments>
     </virtualType>
@@ -106,12 +84,6 @@
     </virtualType>
 
     <!-- Inject logger virtual type where needed -->
-    <type name="Shubo\TbcPayment\Gateway\Http\Client\CreatePaymentClient">
-        <arguments>
-            <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
-        </arguments>
-    </type>
-
     <type name="Shubo\TbcPayment\Gateway\Http\Client\RefundClient">
         <arguments>
             <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
@@ -130,6 +102,21 @@
         </arguments>
     </type>
 
+    <!-- IMPROVE-2: shared advisory-lock service for capture-path serialization. -->
+    <type name="Shubo\TbcPayment\Service\PaymentLock">
+        <arguments>
+            <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
+        </arguments>
+    </type>
+
+    <!-- IMPROVE-8: applier logs the critical amount-mismatch on the dedicated
+         payment channel so it lands in Sentry, not just the local log file. -->
+    <type name="Shubo\TbcPayment\Service\OrderApprovalApplier">
+        <arguments>
+            <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
+        </arguments>
+    </type>
+
     <type name="Shubo\TbcPayment\Gateway\Validator\CallbackValidator">
         <arguments>
             <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
@@ -137,6 +124,22 @@
     </type>
 
     <type name="Shubo\TbcPayment\Controller\Payment\Confirm">
+        <arguments>
+            <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
+        </arguments>
+    </type>
+
+    <type name="Shubo\TbcPayment\Controller\Payment\ReturnAction">
+        <arguments>
+            <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
+        </arguments>
+    </type>
+
+    <!-- OrderLocator resolves the Magento order behind a Flitt order_id on the
+         frontend capture paths (Callback/Confirm/ReturnAction). Its warning logs
+         (bad order_id format, flitt_order_id mismatch) belong on the dedicated
+         payment channel, same as the controllers that consume it. -->
+    <type name="Shubo\TbcPayment\Model\OrderLocator">
         <arguments>
             <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
         </arguments>
@@ -154,12 +157,25 @@
         </arguments>
     </type>
 
-    <!-- Dedicated log file for TBC payment -->
+    <!-- Dedicated log file for TBC payment.
+
+         The `sentry` item is re-listed alongside the dedicated file handler
+         because Magento's DI ObjectManager treats a virtualType `handlers`
+         array as a full REPLACEMENT, not a merge with the base
+         Magento\Framework\Logger\Monolog handlers. Without it, the
+         Shubo\Ops\Logger\SentryHandler that Shubo_Ops merges into the base
+         Monolog is stripped from this dedicated channel — every callback
+         4xx/5xx, signature mismatch, reconciler error and settlement failure
+         would land in shubo_tbc_payment.log ONLY and never reach Sentry.
+         SentryHandler is shared="true" (declared in Shubo_Ops di.xml),
+         self-rate-limits and scrubs PII. Cross-module DI reference only — no
+         PHP `use` of the Ops class anywhere in TbcPayment. -->
     <virtualType name="ShuboTbcPaymentLogger" type="Magento\Framework\Logger\Monolog">
         <arguments>
             <argument name="name" xsi:type="string">shubo_tbc_payment</argument>
             <argument name="handlers" xsi:type="array">
                 <item name="system" xsi:type="object">ShuboTbcPaymentLogHandler</item>
+                <item name="sentry" xsi:type="object">Shubo\Ops\Logger\SentryHandler</item>
             </argument>
         </arguments>
     </virtualType>
@@ -169,6 +185,16 @@
             <argument name="fileName" xsi:type="string">/var/log/shubo_tbc_payment.log</argument>
         </arguments>
     </virtualType>
+
+    <!-- Shared Flitt HTTP transport (SIMPLIFY-2). Owns the curl/timeout/retry
+         block and the response-side debug logging, so it logs to the dedicated
+         channel. The per-client logger blocks below remain because the clients
+         still emit request-side (sanitized) debug logs of their own. -->
+    <type name="Shubo\TbcPayment\Gateway\Http\Client\FlittHttpClient">
+        <arguments>
+            <argument name="logger" xsi:type="object">ShuboTbcPaymentLogger</argument>
+        </arguments>
+    </type>
 
     <type name="Shubo\TbcPayment\Gateway\Http\Client\StatusClient">
         <arguments>

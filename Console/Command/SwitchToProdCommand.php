@@ -195,11 +195,68 @@ class SwitchToProdCommand extends Command
         $this->cacheTypeList->cleanType(self::CACHE_TYPE_CONFIG);
         $this->cacheTypeList->cleanType(self::CACHE_TYPE_FULL_PAGE);
 
+        // Read-back verification: re-read the persisted values straight from
+        // scopeConfig (NOT the in-memory variables we just wrote) and confirm
+        // they match what we intended. This catches a silent partial write —
+        // e.g. a saveConfig that landed at the wrong scope, a cache flush that
+        // didn't take, or a backend model that re-encrypted/mangled the value —
+        // BEFORE we log "AFTER" and tell the operator the cutover succeeded.
+        $persistedMerchantId = (string) $this->scopeConfig->getValue(
+            self::CONFIG_PATH_MERCHANT_ID,
+            ScopeConfig::SCOPE_TYPE_DEFAULT,
+        );
+        $persistedPasswordRaw = (string) $this->scopeConfig->getValue(
+            self::CONFIG_PATH_PASSWORD,
+            ScopeConfig::SCOPE_TYPE_DEFAULT,
+        );
+        $persistedSandboxMode = (string) $this->scopeConfig->getValue(
+            self::CONFIG_PATH_SANDBOX_MODE,
+            ScopeConfig::SCOPE_TYPE_DEFAULT,
+        );
+        $persistedPasswordDecrypted = $persistedPasswordRaw !== ''
+            ? $this->encryptor->decrypt($persistedPasswordRaw)
+            : '';
+
+        $mismatches = [];
+        if ($persistedMerchantId !== $merchantId) {
+            $mismatches[] = 'merchant_id';
+        }
+        if ($persistedPasswordDecrypted !== $secret) {
+            $mismatches[] = 'password';
+        }
+        if ($persistedSandboxMode !== '0') {
+            $mismatches[] = 'sandbox_mode';
+        }
+
+        if ($mismatches !== []) {
+            // Secrets are never logged raw — only the masked tail of the
+            // EXPECTED value. The persisted value is intentionally not echoed.
+            $failLine = sprintf(
+                'TBC READ-BACK FAILED fields=%s merchant_id=%s secret=%s sandbox_mode=%s',
+                implode(',', $mismatches),
+                self::maskTail($merchantId),
+                self::maskTail($secret),
+                $persistedSandboxMode,
+            );
+            $this->cutoverLogger->error($failLine);
+            $output->writeln(
+                '<error>'
+                . (string) __(
+                    'TBC cutover read-back verification FAILED for: %1. '
+                    . 'The persisted config does not match what was intended — '
+                    . 'do NOT take payments until this is resolved.',
+                    implode(', ', $mismatches),
+                )
+                . '</error>'
+            );
+            return Command::FAILURE;
+        }
+
         $afterLine = sprintf(
-            'TBC AFTER merchant_id=%s secret=%s sandbox_mode=%s',
-            self::maskTail($merchantId),
-            self::maskTail($secret),
-            '0',
+            'TBC AFTER merchant_id=%s secret=%s sandbox_mode=%s (read-back OK)',
+            self::maskTail($persistedMerchantId),
+            self::maskTail($persistedPasswordDecrypted),
+            $persistedSandboxMode,
         );
         $this->cutoverLogger->info($afterLine);
 

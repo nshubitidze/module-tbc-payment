@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Shubo\TbcPayment\Controller\Payment;
 
 use Magento\Checkout\Model\Session as CheckoutSession;
-use Magento\Framework\Api\SearchCriteriaBuilder;
 use Magento\Framework\App\Action\HttpPostActionInterface;
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\Controller\Result\Json as JsonResult;
@@ -15,10 +14,14 @@ use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
-use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
-use Shubo\TbcPayment\Gateway\Response\PaymentInfoKeys;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
+use Shubo\TbcPayment\Model\FlittStatus;
+use Shubo\TbcPayment\Model\OrderLocator;
+use Shubo\TbcPayment\Service\ApprovalContext;
+use Shubo\TbcPayment\Service\ApprovalResult;
+use Shubo\TbcPayment\Service\OrderApprovalApplier;
+use Shubo\TbcPayment\Service\PaymentLock;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -30,9 +33,11 @@ use Shubo\TbcPayment\Service\SettlementService;
  *
  * Race-safety: Callback (server-to-server) and PendingOrderReconciler can run
  * concurrently with this controller. We wrap the order load + state check +
- * approval inside a DB transaction with a SELECT ... FOR UPDATE on the order
- * row so only one of the three paths can transition the order to PROCESSING
- * and create the invoice.
+ * approval inside a {@see PaymentLock} (IMPROVE-2) AND a DB transaction with a
+ * SELECT ... FOR UPDATE on the order row. The advisory lock is what actually
+ * serializes us against Callback/Cron (whose plain SELECT neither blocks nor is
+ * blocked by FOR UPDATE); the FOR UPDATE stays as belt-and-suspenders. On lock
+ * contention we simply skip — the concurrent holder finalises the order.
  */
 class Confirm implements HttpPostActionInterface
 {
@@ -42,11 +47,12 @@ class Confirm implements HttpPostActionInterface
         private readonly OrderRepositoryInterface $orderRepository,
         private readonly StatusClient $statusClient,
         private readonly CallbackValidator $callbackValidator,
-        private readonly Config $config,
+        private readonly OrderApprovalApplier $approvalApplier,
         private readonly SettlementService $settlementService,
         private readonly LoggerInterface $logger,
         private readonly ResourceConnection $resourceConnection,
-        private readonly SearchCriteriaBuilder $searchCriteriaBuilder,
+        private readonly OrderLocator $orderLocator,
+        private readonly PaymentLock $paymentLock,
     ) {
     }
 
@@ -76,8 +82,8 @@ class Confirm implements HttpPostActionInterface
             }
 
             $storeId = (int) $sessionOrder->getStoreId();
-            $response = $this->statusClient->checkStatus($flittOrderId, $storeId);
-            $responseData = $response['response'] ?? $response;
+            // StatusClient::checkStatus already unwraps the Flitt `response` envelope.
+            $responseData = $this->statusClient->checkStatus($flittOrderId, $storeId);
             $flittStatus = $responseData['order_status'] ?? '';
 
             $this->logger->info('TBC confirm: Flitt status check', [
@@ -85,7 +91,7 @@ class Confirm implements HttpPostActionInterface
                 'flitt_status' => $flittStatus,
             ]);
 
-            if ($flittStatus !== 'approved') {
+            if ($flittStatus !== FlittStatus::APPROVED) {
                 return $result->setData([
                     'success' => false,
                     'flitt_status' => $flittStatus,
@@ -103,11 +109,26 @@ class Confirm implements HttpPostActionInterface
                 ]);
             }
 
-            $order = $this->processWithLock(
-                (int) $sessionOrder->getEntityId(),
-                $sessionOrder->getIncrementId(),
-                $responseData,
-                $storeId,
+            // IMPROVE-2: serialize against Callback/ReturnAction/Cron via the
+            // advisory lock, keyed by flitt_order_id. On contention withLock
+            // returns null; the concurrent holder is finalising the order, so we
+            // just report success and skip — exactly the existing
+            // already-processed semantics.
+            //
+            // processWithLock returns the order ONLY when this run genuinely
+            // CAPTURED (ApprovalResult::Captured). On a preauth-held result the
+            // funds are only HELD, not captured — it returns null so settlement
+            // does NOT run (settling on a held pre-auth would distribute the full
+            // amount to sub-merchant receivers before capture). This unifies
+            // Confirm with the other four capture paths, which all gate
+            // settlement on Captured.
+            $order = $this->paymentLock->withLock(
+                $flittOrderId,
+                fn (): ?Order => $this->processWithLock(
+                    (int) $sessionOrder->getEntityId(),
+                    $sessionOrder->getIncrementId(),
+                    $responseData,
+                )
             );
 
             // Trigger settlement OUTSIDE the order transaction; settlement does its own
@@ -140,8 +161,11 @@ class Confirm implements HttpPostActionInterface
     /**
      * Acquire a row-level lock on the order, re-check state, and process the approval.
      *
-     * Returns the processed order (so the caller can run settlement after commit) or
-     * null if another path beat us to it.
+     * Returns the processed order (so the caller can run settlement after
+     * commit) ONLY when this run genuinely CAPTURED. Returns null when another
+     * path beat us to it (already PROCESSING), when the capture was refused
+     * (amount mismatch), OR when only a pre-auth was HELD — settlement must not
+     * run on a held pre-auth, so the null return suppresses it.
      *
      * @param array<string, mixed> $responseData
      */
@@ -149,7 +173,6 @@ class Confirm implements HttpPostActionInterface
         int $orderEntityId,
         string $incrementId,
         array $responseData,
-        int $storeId,
     ): ?Order {
         $connection = $this->resourceConnection->getConnection();
         $connection->beginTransaction();
@@ -173,7 +196,8 @@ class Confirm implements HttpPostActionInterface
             }
 
             // Re-load via the repository so we get the full domain object.
-            $order = $this->loadOrder($incrementId);
+            /** @var Order|null $order */
+            $order = $this->orderLocator->byIncrementId($incrementId);
 
             if ($order === null) {
                 $connection->rollBack();
@@ -193,83 +217,39 @@ class Confirm implements HttpPostActionInterface
                 return null;
             }
 
-            /** @var Payment $payment */
-            $payment = $order->getPayment();
-            $this->processApproval($order, $payment, $responseData, $storeId);
+            // Apply the shared approve mutation (in-memory only); the lock/txn/save
+            // boundary stays here in the controller.
+            $applyResult = $this->approvalApplier->apply($order, $responseData, ApprovalContext::Confirm);
+
+            // IMPROVE-8: a refused capture (amount mismatch) means the cart was
+            // re-priced mid-flow. The applier mutated nothing and logged at
+            // `critical`; roll back and leave the order untouched for an admin to
+            // reconcile. Return null so no settlement runs.
+            if ($applyResult === ApprovalResult::RefusedAmountMismatch) {
+                $connection->rollBack();
+                $this->logger->error('TBC confirm: capture refused (amount mismatch), left for admin reconcile', [
+                    'order_id' => $order->getIncrementId(),
+                ]);
+                return null;
+            }
+
             $this->orderRepository->save($order);
 
             $connection->commit();
 
-            return $order;
+            $this->logger->info('TBC confirm: order approved', [
+                'order_id' => $order->getIncrementId(),
+                'payment_id' => (string) ($responseData['payment_id'] ?? ''),
+                'result' => $applyResult->name,
+            ]);
+
+            // Only a genuine capture is eligible for settlement. A preauth-held
+            // order is committed/saved above (the hold IS persisted) but returns
+            // null so the caller skips settlement until a real capture occurs.
+            return $applyResult === ApprovalResult::Captured ? $order : null;
         } catch (\Exception $e) {
             $connection->rollBack();
             throw $e;
         }
-    }
-
-    /**
-     * Load an order by increment ID via the repository.
-     */
-    private function loadOrder(string $incrementId): ?Order
-    {
-        $searchCriteria = $this->searchCriteriaBuilder
-            ->addFilter('increment_id', $incrementId)
-            ->setPageSize(1)
-            ->create();
-
-        $orders = $this->orderRepository->getList($searchCriteria)->getItems();
-
-        /** @var Order|null $order */
-        $order = reset($orders) ?: null;
-
-        return $order;
-    }
-
-    /**
-     * @param array<string, mixed> $responseData
-     */
-    private function processApproval(Order $order, Payment $payment, array $responseData, int $storeId): void
-    {
-        PaymentInfoKeys::apply($payment, $responseData);
-
-        $payment->setAdditionalInformation('flitt_order_id', $responseData['order_id'] ?? '');
-        $payment->setAdditionalInformation('awaiting_flitt_confirmation', false);
-
-        $paymentId = (string) ($responseData['payment_id'] ?? '');
-        if ($paymentId !== '') {
-            // NOTE: We intentionally do NOT call setParentTransactionId() here.
-            // In direct-sale (non-preauth) mode there is no auth transaction upstream
-            // that the capture could point at, and inventing a synthetic
-            // "{increment_id}-auth" parent_txn_id produced dangling parent links in the
-            // admin transaction tree. When preauth capture is implemented as a
-            // distinct workflow, reintroduce the parent pointer from a REAL auth row.
-            $payment->setTransactionId($paymentId);
-        }
-
-        if ($this->config->isPreauth($storeId)) {
-            $payment->setAdditionalInformation('preauth_approved', true);
-            $payment->setIsTransactionPending(false);
-            $payment->setIsTransactionClosed(false);
-            $order->setState(Order::STATE_PROCESSING);
-            $order->setStatus(Order::STATE_PROCESSING);
-            $order->addCommentToStatusHistory(
-                (string) __('Funds held by TBC Bank. Payment ID: %1. Use "Capture Payment" to charge.', $paymentId)
-            );
-        } else {
-            $payment->setIsTransactionPending(false);
-            $payment->setIsTransactionClosed(true);
-            $amountMinor = (int) ($responseData['amount'] ?? (int) round($order->getGrandTotal() * 100));
-            $payment->registerCaptureNotification($amountMinor / 100);
-            $order->setState(Order::STATE_PROCESSING);
-            $order->setStatus(Order::STATE_PROCESSING);
-            $order->addCommentToStatusHistory(
-                (string) __('Payment approved by TBC Bank. Payment ID: %1', $paymentId)
-            );
-        }
-
-        $this->logger->info('TBC confirm: order approved', [
-            'order_id' => $order->getIncrementId(),
-            'payment_id' => $paymentId,
-        ]);
     }
 }

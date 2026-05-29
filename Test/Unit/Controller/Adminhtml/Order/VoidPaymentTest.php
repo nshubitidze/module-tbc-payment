@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Shubo\TbcPayment\Test\Unit\Controller\Adminhtml\Order;
 
 use Magento\Backend\App\Action\Context;
+use Magento\Framework\App\Action\HttpPostActionInterface;
 use Magento\Framework\App\Request\Http as HttpRequest;
 use Magento\Framework\Controller\Result\Redirect as RedirectResult;
 use Magento\Framework\Controller\Result\RedirectFactory;
@@ -16,18 +17,20 @@ use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Controller\Adminhtml\Order\VoidPayment;
-use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
 use Shubo\TbcPayment\Gateway\Http\Client\VoidClient;
 use Shubo\TbcPayment\Model\Ui\ConfigProvider;
 
 /**
- * BUG-5: The admin "Void Payment" button MUST call the Flitt reverse API
- * to release the pre-authorization hold BEFORE cancelling the Magento order.
+ * IMPROVE-7 — the admin "Void Payment" controller is POST-only, server-side
+ * guarded (only an un-captured preauth order in PROCESSING is voidable), and
+ * reverses the AUTHORIZED (held) amount, not a fresh grand_total*100. The Flitt
+ * reverse call releases the pre-auth hold BEFORE the local cancel; on upstream
+ * failure the local cancel still proceeds (soft-fail per CLAUDE.md §10).
  *
- * Soft-fail policy (CLAUDE.md §10): if the upstream reverse call fails, we
- * still cancel locally and surface a warning — the local cancel is the
- * contract, the reversal is cleanup.
+ * SIMPLIFY-5 — the wire-payload build + Flitt signature now live in VoidClient;
+ * the controller hands order-level inputs (flitt_order_id, amount, currency,
+ * store) to the client.
  */
 class VoidPaymentTest extends TestCase
 {
@@ -39,7 +42,6 @@ class VoidPaymentTest extends TestCase
     private LoggerInterface&MockObject $logger;
     private Context&MockObject $context;
     private VoidClient&MockObject $voidClient;
-    private Config&MockObject $config;
 
     /** @var list<string> */
     private array $capturedErrors = [];
@@ -59,7 +61,6 @@ class VoidPaymentTest extends TestCase
         $this->request         = $this->createMock(HttpRequest::class);
         $this->logger          = $this->createMock(LoggerInterface::class);
         $this->voidClient      = $this->createMock(VoidClient::class);
-        $this->config          = $this->createMock(Config::class);
 
         $this->redirectResult->method('setPath')->willReturnSelf();
         $this->redirectFactory->method('create')->willReturn($this->redirectResult);
@@ -88,162 +89,224 @@ class VoidPaymentTest extends TestCase
         $this->context->method('getResultRedirectFactory')->willReturn($this->redirectFactory);
     }
 
-    public function testReverseApiCalledWithFlittOrderIdAndSignedParams(): void
+    private function controller(): VoidPayment
+    {
+        return new VoidPayment(
+            $this->context,
+            $this->orderRepository,
+            $this->logger,
+            $this->voidClient,
+        );
+    }
+
+    /**
+     * Build a voidable preauth payment (PROCESSING + preauth_approved + not
+     * captured). $authorized lets a test simulate a recorded authorization
+     * amount; 0.0 falls back to the order grand total.
+     */
+    private function voidablePayment(string $flittOrderId = 'duka_000042_1234', float $authorized = 0.0): Payment&MockObject
     {
         $payment = $this->createMock(Payment::class);
         $payment->method('getMethod')->willReturn(ConfigProvider::CODE);
+        $payment->method('getAmountAuthorized')->willReturn($authorized);
         $payment->method('getAdditionalInformation')->willReturnCallback(
-            static fn (string $k): mixed
-                => $k === 'flitt_order_id' ? 'duka_000042_1234' : null
+            static fn (string $k): mixed => match ($k) {
+                'flitt_order_id' => $flittOrderId,
+                'preauth_approved' => true,
+                'capture_status' => null,
+                default => null,
+            }
         );
+        return $payment;
+    }
 
+    private function voidableOrder(Payment $payment, float $grandTotal = 10.50): Order&MockObject
+    {
         $order = $this->createMock(Order::class);
         $order->method('getPayment')->willReturn($payment);
         $order->method('getStoreId')->willReturn(1);
-        $order->method('getGrandTotal')->willReturn(10.50);
+        $order->method('getState')->willReturn(Order::STATE_PROCESSING);
+        $order->method('getGrandTotal')->willReturn($grandTotal);
         $order->method('getOrderCurrencyCode')->willReturn('GEL');
-        $order->expects(self::once())->method('cancel')->willReturnSelf();
         $order->method('addCommentToStatusHistory')->willReturnSelf();
+        return $order;
+    }
+
+    /** The controller must be POST-only so a void cannot be triggered by a GET. */
+    public function testControllerIsPostOnly(): void
+    {
+        self::assertInstanceOf(HttpPostActionInterface::class, $this->controller());
+    }
+
+    /**
+     * Voidable preauth → reverse releases the AUTHORIZED amount (grand-total
+     * fallback here = 1050 tetri), and the order is cancelled.
+     */
+    public function testVoidableOrderReversesAuthorizedAmount(): void
+    {
+        $payment = $this->voidablePayment();
+        $order = $this->voidableOrder($payment, 10.50);
+        $order->expects(self::once())->method('cancel')->willReturnSelf();
 
         $this->orderRepository->expects(self::once())->method('get')->with(42)->willReturn($order);
         $this->orderRepository->expects(self::once())->method('save')->with($order);
-
-        $this->config->method('getMerchantId')->with(1)->willReturn('1549901');
-        $this->config->method('getPassword')->with(1)->willReturn('test_secret');
-
-        $expectedSignature = Config::generateSignature(
-            [
-                'order_id' => 'duka_000042_1234',
-                'merchant_id' => '1549901',
-                'amount' => '1050',
-                'currency' => 'GEL',
-            ],
-            'test_secret',
-        );
 
         $this->voidClient->expects(self::once())
             ->method('reverse')
-            ->with(
-                self::callback(static function (array $params) use ($expectedSignature): bool {
-                    return $params['order_id'] === 'duka_000042_1234'
-                        && $params['merchant_id'] === '1549901'
-                        && $params['amount'] === '1050'
-                        && $params['currency'] === 'GEL'
-                        && isset($params['signature'])
-                        && strlen((string) $params['signature']) === 40
-                        && $params['signature'] === $expectedSignature;
-                }),
-                1,
-            )
-            ->willReturn(['response' => ['reverse_status' => 'approved', 'reverse_amount' => 1050]]);
+            ->with('duka_000042_1234', 1050, 'GEL', 1)
+            ->willReturn(['response' => ['reverse_status' => 'approved']]);
 
-        $controller = new VoidPayment(
-            $this->context,
-            $this->orderRepository,
-            $this->logger,
-            $this->voidClient,
-            $this->config,
-        );
+        $this->controller()->execute();
 
-        $controller->execute();
-
-        self::assertEmpty($this->capturedErrors, 'No error messages expected on happy path.');
-        self::assertNotEmpty($this->capturedSuccesses, 'Success message expected.');
-    }
-
-    public function testReverseSkippedWhenNoFlittOrderId(): void
-    {
-        $payment = $this->createMock(Payment::class);
-        $payment->method('getMethod')->willReturn(ConfigProvider::CODE);
-        $payment->method('getAdditionalInformation')->willReturn('');
-
-        $order = $this->createMock(Order::class);
-        $order->method('getPayment')->willReturn($payment);
-        $order->method('getStoreId')->willReturn(1);
-        $order->expects(self::once())->method('cancel')->willReturnSelf();
-        $order->method('addCommentToStatusHistory')->willReturnSelf();
-
-        $this->orderRepository->expects(self::once())->method('get')->with(42)->willReturn($order);
-        $this->orderRepository->expects(self::once())->method('save')->with($order);
-
-        // Reverse MUST NOT be called when there is no flitt_order_id.
-        $this->voidClient->expects(self::never())->method('reverse');
-
-        $controller = new VoidPayment(
-            $this->context,
-            $this->orderRepository,
-            $this->logger,
-            $this->voidClient,
-            $this->config,
-        );
-
-        $controller->execute();
-
-        self::assertEmpty($this->capturedErrors, 'Skipping reverse is normal, no error expected.');
+        self::assertEmpty($this->capturedErrors, 'No error expected on the happy void path.');
         self::assertNotEmpty($this->capturedSuccesses);
     }
 
-    public function testOrderStillCancelledWhenReverseApiThrows(): void
+    /**
+     * When the payment carries a distinct recorded authorization amount, the
+     * reverse uses THAT (in tetri), not the order grand total.
+     */
+    public function testReverseUsesRecordedAuthorizedAmountOverGrandTotal(): void
+    {
+        // Authorization recorded as 8.00; grand total is 10.50. Reverse must
+        // release 800 tetri (the held authorization), not 1050.
+        $payment = $this->voidablePayment(authorized: 8.00);
+        $order = $this->voidableOrder($payment, 10.50);
+        $order->method('cancel')->willReturnSelf();
+
+        $this->orderRepository->method('get')->willReturn($order);
+
+        $this->voidClient->expects(self::once())
+            ->method('reverse')
+            ->with('duka_000042_1234', 800, 'GEL', 1)
+            ->willReturn(['response' => ['reverse_status' => 'approved']]);
+
+        $this->controller()->execute();
+
+        self::assertNotEmpty($this->capturedSuccesses);
+    }
+
+    /**
+     * Already-captured order → guard blocks, NO reverse attempted, NO cancel,
+     * error surfaced.
+     */
+    public function testCapturedOrderIsRejectedWithoutReverse(): void
     {
         $payment = $this->createMock(Payment::class);
         $payment->method('getMethod')->willReturn(ConfigProvider::CODE);
         $payment->method('getAdditionalInformation')->willReturnCallback(
-            static fn (string $k): mixed
-                => $k === 'flitt_order_id' ? 'duka_000042_1234' : null
+            static fn (string $k): mixed => match ($k) {
+                'flitt_order_id' => 'duka_000042_1234',
+                'preauth_approved' => true,
+                'capture_status' => 'captured',
+                default => null,
+            }
         );
 
         $order = $this->createMock(Order::class);
         $order->method('getPayment')->willReturn($payment);
         $order->method('getStoreId')->willReturn(1);
-        $order->method('getGrandTotal')->willReturn(10.50);
-        $order->method('getOrderCurrencyCode')->willReturn('GEL');
-        // Local cancel MUST still happen even when reverse fails.
-        $order->expects(self::once())->method('cancel')->willReturnSelf();
-        $order->method('addCommentToStatusHistory')->willReturnSelf();
+        $order->method('getState')->willReturn(Order::STATE_PROCESSING);
+        $order->expects(self::never())->method('cancel');
 
-        $this->orderRepository->expects(self::once())->method('get')->with(42)->willReturn($order);
-        $this->orderRepository->expects(self::once())->method('save')->with($order);
+        $this->orderRepository->method('get')->willReturn($order);
+        $this->orderRepository->expects(self::never())->method('save');
+        $this->voidClient->expects(self::never())->method('reverse');
 
-        $this->config->method('getMerchantId')->willReturn('1549901');
-        $this->config->method('getPassword')->willReturn('test_secret');
+        $this->controller()->execute();
 
-        $this->voidClient->expects(self::once())
-            ->method('reverse')
-            ->willThrowException(new FlittApiException(__('Flitt void API returned HTTP 500')));
-
-        $controller = new VoidPayment(
-            $this->context,
-            $this->orderRepository,
-            $this->logger,
-            $this->voidClient,
-            $this->config,
-        );
-
-        $controller->execute();
-
-        self::assertNotEmpty(
-            $this->capturedWarnings,
-            'Warning message expected when reverse call fails.'
-        );
-        self::assertStringContainsString(
-            'hold could not be released',
-            $this->capturedWarnings[0],
-            'Warning should explain the pre-auth hold release failure.'
-        );
+        self::assertNotEmpty($this->capturedErrors, 'A captured order must be rejected.');
+        self::assertStringContainsString('cannot be voided', $this->capturedErrors[0]);
     }
 
-    public function testReverseStatusCopiedToPaymentAdditionalInfo(): void
+    /**
+     * Non-preauth order (no held funds) → guard blocks, no reverse, no cancel.
+     */
+    public function testNonPreauthOrderIsRejected(): void
     {
         $payment = $this->createMock(Payment::class);
         $payment->method('getMethod')->willReturn(ConfigProvider::CODE);
         $payment->method('getAdditionalInformation')->willReturnCallback(
-            static fn (string $k): mixed
-                => $k === 'flitt_order_id' ? 'duka_000042_1234' : null
+            static fn (string $k): mixed => $k === 'flitt_order_id' ? 'duka_000042_1234' : null
         );
 
-        // Capture every setAdditionalInformation call so we can assert reverse_status was set.
-        /** @var array<string, mixed> $captured */
+        $order = $this->createMock(Order::class);
+        $order->method('getPayment')->willReturn($payment);
+        $order->method('getStoreId')->willReturn(1);
+        $order->method('getState')->willReturn(Order::STATE_PROCESSING);
+        $order->expects(self::never())->method('cancel');
+
+        $this->orderRepository->method('get')->willReturn($order);
+        $this->voidClient->expects(self::never())->method('reverse');
+
+        $this->controller()->execute();
+
+        self::assertNotEmpty($this->capturedErrors);
+    }
+
+    /**
+     * Not-in-processing order (e.g. already complete/closed) → guard blocks.
+     */
+    public function testNonProcessingOrderIsRejected(): void
+    {
+        $payment = $this->voidablePayment();
+
+        $order = $this->createMock(Order::class);
+        $order->method('getPayment')->willReturn($payment);
+        $order->method('getStoreId')->willReturn(1);
+        $order->method('getState')->willReturn(Order::STATE_COMPLETE);
+        $order->expects(self::never())->method('cancel');
+
+        $this->orderRepository->method('get')->willReturn($order);
+        $this->voidClient->expects(self::never())->method('reverse');
+
+        $this->controller()->execute();
+
+        self::assertNotEmpty($this->capturedErrors);
+    }
+
+    /** Wrong payment method → rejected, no reverse. */
+    public function testWrongPaymentMethodIsRejected(): void
+    {
+        $payment = $this->createMock(Payment::class);
+        $payment->method('getMethod')->willReturn('checkmo');
+
+        $order = $this->createMock(Order::class);
+        $order->method('getPayment')->willReturn($payment);
+
+        $this->orderRepository->method('get')->willReturn($order);
+        $this->voidClient->expects(self::never())->method('reverse');
+
+        $this->controller()->execute();
+
+        self::assertNotEmpty($this->capturedErrors);
+    }
+
+    /** Reverse API throws → local cancel still proceeds, warning surfaced. */
+    public function testOrderStillCancelledWhenReverseApiThrows(): void
+    {
+        $payment = $this->voidablePayment();
+        $order = $this->voidableOrder($payment);
+        $order->expects(self::once())->method('cancel')->willReturnSelf();
+
+        $this->orderRepository->expects(self::once())->method('get')->with(42)->willReturn($order);
+        $this->orderRepository->expects(self::once())->method('save')->with($order);
+
+        $this->voidClient->expects(self::once())
+            ->method('reverse')
+            ->willThrowException(new FlittApiException(__('Flitt API returned HTTP 500')));
+
+        $this->controller()->execute();
+
+        self::assertNotEmpty($this->capturedWarnings, 'Warning expected when reverse fails.');
+        self::assertStringContainsString('hold could not be released', $this->capturedWarnings[0]);
+    }
+
+    /** reverse_status copied to payment additional info on success. */
+    public function testReverseStatusCopiedToPaymentAdditionalInfo(): void
+    {
         $captured = [];
+        $payment = $this->voidablePayment();
         $payment->method('setAdditionalInformation')->willReturnCallback(
             function (string $k, mixed $v) use (&$captured, $payment): Payment {
                 $captured[$k] = $v;
@@ -251,58 +314,29 @@ class VoidPaymentTest extends TestCase
             }
         );
 
-        $order = $this->createMock(Order::class);
-        $order->method('getPayment')->willReturn($payment);
-        $order->method('getStoreId')->willReturn(1);
-        $order->method('getGrandTotal')->willReturn(10.50);
-        $order->method('getOrderCurrencyCode')->willReturn('GEL');
+        $order = $this->voidableOrder($payment);
         $order->method('cancel')->willReturnSelf();
-        $order->method('addCommentToStatusHistory')->willReturnSelf();
 
         $this->orderRepository->method('get')->willReturn($order);
-
-        $this->config->method('getMerchantId')->willReturn('1549901');
-        $this->config->method('getPassword')->willReturn('test_secret');
 
         $this->voidClient->method('reverse')
             ->willReturn(['response' => ['reverse_status' => 'approved']]);
 
-        $controller = new VoidPayment(
-            $this->context,
-            $this->orderRepository,
-            $this->logger,
-            $this->voidClient,
-            $this->config,
-        );
-
-        $controller->execute();
+        $this->controller()->execute();
 
         self::assertArrayHasKey('reverse_status', $captured);
         self::assertSame('approved', $captured['reverse_status']);
     }
 
+    /** Declined reverse_status still cancels locally with a warning. */
     public function testReverseDeclinedStillCancelsLocally(): void
     {
-        $payment = $this->createMock(Payment::class);
-        $payment->method('getMethod')->willReturn(ConfigProvider::CODE);
-        $payment->method('getAdditionalInformation')->willReturnCallback(
-            static fn (string $k): mixed
-                => $k === 'flitt_order_id' ? 'duka_000042_1234' : null
-        );
-
-        $order = $this->createMock(Order::class);
-        $order->method('getPayment')->willReturn($payment);
-        $order->method('getStoreId')->willReturn(1);
-        $order->method('getGrandTotal')->willReturn(10.50);
-        $order->method('getOrderCurrencyCode')->willReturn('GEL');
+        $payment = $this->voidablePayment();
+        $order = $this->voidableOrder($payment);
         $order->expects(self::once())->method('cancel')->willReturnSelf();
-        $order->method('addCommentToStatusHistory')->willReturnSelf();
 
         $this->orderRepository->expects(self::once())->method('get')->with(42)->willReturn($order);
         $this->orderRepository->expects(self::once())->method('save')->with($order);
-
-        $this->config->method('getMerchantId')->willReturn('1549901');
-        $this->config->method('getPassword')->willReturn('test_secret');
 
         $this->voidClient->expects(self::once())
             ->method('reverse')
@@ -313,19 +347,11 @@ class VoidPaymentTest extends TestCase
                 ],
             ]);
 
-        $controller = new VoidPayment(
-            $this->context,
-            $this->orderRepository,
-            $this->logger,
-            $this->voidClient,
-            $this->config,
-        );
-
-        $controller->execute();
+        $this->controller()->execute();
 
         self::assertNotEmpty(
             $this->capturedWarnings,
-            'A warning message is expected when reverse_status is not approved/success.'
+            'A warning is expected when reverse_status is not approved/success.'
         );
     }
 }

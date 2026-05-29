@@ -7,10 +7,7 @@ namespace Shubo\TbcPayment\Test\Unit\Controller\Payment;
 use Magento\Checkout\Model\Session as CheckoutSession;
 use Magento\Framework\Controller\Result\Json as JsonResult;
 use Magento\Framework\Controller\Result\JsonFactory;
-use Magento\Framework\HTTP\Client\Curl;
-use Magento\Framework\HTTP\Client\CurlFactory;
-use Magento\Framework\Locale\ResolverInterface;
-use Magento\Framework\Serialize\Serializer\Json;
+use Shubo\TbcPayment\Service\FlittLanguageResolver;
 use Magento\Framework\UrlInterface;
 use Magento\Quote\Api\CartRepositoryInterface;
 use Magento\Quote\Model\Quote;
@@ -21,10 +18,15 @@ use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Controller\Payment\Params;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
+use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
+use Shubo\TbcPayment\Gateway\Http\Client\FlittHttpClient;
 
 /**
- * Regression tests for BUG-1: Params controller must enforce a CURL timeout
- * so a hung Flitt token endpoint cannot exhaust PHP workers.
+ * Params controller tests.
+ *
+ * Transport (curl/timeouts) now lives in FlittHttpClient and is covered by
+ * FlittHttpClientTest; these tests assert the controller delegates to the token
+ * endpoint without requesting a retry, and surfaces failures correctly.
  */
 class ParamsTest extends TestCase
 {
@@ -34,10 +36,8 @@ class ParamsTest extends TestCase
     private Config&MockObject $config;
     private UrlInterface&MockObject $urlBuilder;
     private LoggerInterface&MockObject $logger;
-    private CurlFactory&MockObject $curlFactory;
-    private Json&MockObject $json;
-    private ResolverInterface&MockObject $localeResolver;
-    private Curl&MockObject $curl;
+    private FlittHttpClient&MockObject $httpClient;
+    private FlittLanguageResolver&MockObject $languageResolver;
     private JsonResult&MockObject $jsonResult;
     private UserFacingErrorMapper&MockObject $userFacingErrorMapper;
 
@@ -49,71 +49,77 @@ class ParamsTest extends TestCase
         $this->config = $this->createMock(Config::class);
         $this->urlBuilder = $this->createMock(UrlInterface::class);
         $this->logger = $this->createMock(LoggerInterface::class);
-        $this->curlFactory = $this->createMock(CurlFactory::class);
-        $this->json = $this->createMock(Json::class);
-        $this->localeResolver = $this->createMock(ResolverInterface::class);
-        $this->curl = $this->createMock(Curl::class);
+        $this->httpClient = $this->createMock(FlittHttpClient::class);
+        $this->languageResolver = $this->createMock(FlittLanguageResolver::class);
         $this->jsonResult = $this->createMock(JsonResult::class);
         $this->userFacingErrorMapper = $this->createMock(UserFacingErrorMapper::class);
 
         $this->jsonFactory->method('create')->willReturn($this->jsonResult);
         $this->jsonResult->method('setData')->willReturnSelf();
-        $this->curlFactory->method('create')->willReturn($this->curl);
     }
 
-    public function testTimeoutIsAppliedToCurlBeforePost(): void
+    public function testDelegatesToTokenEndpointWithoutRetry(): void
     {
         $this->primeQuoteAndConfig();
-        $this->json->method('serialize')->willReturn('{"request":{}}');
-        $this->json->method('unserialize')->willReturn([
-            'response' => ['response_status' => 'success', 'token' => 'tok-abc'],
-        ]);
 
-        $this->curl->method('getStatus')->willReturn(200);
-        $this->curl->method('getBody')->willReturn('{"response":{"response_status":"success","token":"tok-abc"}}');
-
-        // Verify timeout is set BEFORE the request fires.
-        $callOrder = [];
-        $this->curl->expects(self::atLeastOnce())
-            ->method('setTimeout')
-            ->willReturnCallback(static function (int $value) use (&$callOrder): void {
-                $callOrder[] = ['setTimeout', $value];
-            });
-
-        $optionsApplied = [];
-        $this->curl->expects(self::atLeastOnce())
-            ->method('setOptions')
-            ->willReturnCallback(static function (array $opts) use (&$callOrder, &$optionsApplied): void {
-                $callOrder[] = ['setOptions', $opts];
-                $optionsApplied = $opts;
-            });
-
-        $this->curl->expects(self::once())
+        $postedEndpoint = null;
+        $postedRetryable = null;
+        $this->httpClient->expects(self::once())
             ->method('post')
-            ->willReturnCallback(static function () use (&$callOrder): void {
-                $callOrder[] = ['post'];
+            ->willReturnCallback(
+                function (
+                    string $endpoint,
+                    $body,
+                    int $storeId,
+                    bool $retryable = false
+                ) use (
+                    &$postedEndpoint,
+                    &$postedRetryable
+                ): array {
+                    $postedEndpoint = $endpoint;
+                    $postedRetryable = $retryable;
+                    return ['response' => ['response_status' => 'success', 'token' => 'tok-abc']];
+                }
+            );
+
+        $captured = null;
+        $this->jsonResult->expects(self::atLeastOnce())
+            ->method('setData')
+            ->willReturnCallback(function (array $data) use (&$captured): JsonResult {
+                $captured = $data;
+                return $this->jsonResult;
             });
 
         $controller = $this->buildController();
         $controller->execute();
 
-        self::assertArrayHasKey(CURLOPT_TIMEOUT, $optionsApplied, 'CURLOPT_TIMEOUT must be set');
-        self::assertArrayHasKey(CURLOPT_CONNECTTIMEOUT, $optionsApplied, 'CURLOPT_CONNECTTIMEOUT must be set');
-        self::assertSame(30, $optionsApplied[CURLOPT_TIMEOUT]);
-        self::assertSame(10, $optionsApplied[CURLOPT_CONNECTTIMEOUT]);
+        self::assertSame('/api/checkout/token', $postedEndpoint);
+        self::assertFalse($postedRetryable, 'Token minting must NOT be retryable');
+        self::assertIsArray($captured);
+        self::assertTrue($captured['success']);
+        self::assertSame('tok-abc', $captured['token']);
+    }
 
-        // Ordering: timeouts MUST be configured before post() is invoked.
-        $postIndex = array_search(['post'], $callOrder, true);
-        self::assertNotFalse($postIndex);
-        $optionsIndex = null;
-        foreach ($callOrder as $i => $call) {
-            if ($call[0] === 'setOptions') {
-                $optionsIndex = $i;
-                break;
-            }
-        }
-        self::assertNotNull($optionsIndex);
-        self::assertLessThan($postIndex, $optionsIndex, 'setOptions must run before post');
+    public function testTransportFailureReturnsFriendlyError(): void
+    {
+        $this->primeQuoteAndConfig();
+
+        $this->httpClient->method('post')
+            ->willThrowException(new FlittApiException(__('Unable to reach the TBC payment gateway.')));
+
+        $captured = null;
+        $this->jsonResult->expects(self::atLeastOnce())
+            ->method('setData')
+            ->willReturnCallback(function (array $data) use (&$captured): JsonResult {
+                $captured = $data;
+                return $this->jsonResult;
+            });
+
+        $controller = $this->buildController();
+        $controller->execute();
+
+        self::assertIsArray($captured);
+        self::assertFalse($captured['success']);
     }
 
     private function buildController(): Params
@@ -125,9 +131,8 @@ class ParamsTest extends TestCase
             config: $this->config,
             urlBuilder: $this->urlBuilder,
             logger: $this->logger,
-            curlFactory: $this->curlFactory,
-            json: $this->json,
-            localeResolver: $this->localeResolver,
+            httpClient: $this->httpClient,
+            languageResolver: $this->languageResolver,
             userFacingErrorMapper: $this->userFacingErrorMapper,
         );
     }
@@ -140,7 +145,6 @@ class ParamsTest extends TestCase
             ->getMock();
         $quotePayment->method('setAdditionalInformation')->willReturnSelf();
 
-        // Quote uses DataObject magic getters; declare via addMethods.
         $quote = $this->getMockBuilder(Quote::class)
             ->disableOriginalConstructor()
             ->onlyMethods(['getId', 'getStoreId', 'getPayment', 'reserveOrderId', 'getReservedOrderId'])
@@ -164,6 +168,6 @@ class ParamsTest extends TestCase
         $this->config->method('isDebugEnabled')->willReturn(false);
 
         $this->urlBuilder->method('getUrl')->willReturn('https://duka.ge/cb');
-        $this->localeResolver->method('getLocale')->willReturn('en_US');
+        $this->languageResolver->method('resolve')->willReturn('en');
     }
 }

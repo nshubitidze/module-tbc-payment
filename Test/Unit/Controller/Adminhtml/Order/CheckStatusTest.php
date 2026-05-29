@@ -17,10 +17,13 @@ use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Controller\Adminhtml\Order\CheckStatus;
-use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
 use Shubo\TbcPayment\Model\Ui\ConfigProvider;
+use Shubo\TbcPayment\Service\ApprovalContext;
+use Shubo\TbcPayment\Service\ApprovalResult;
+use Shubo\TbcPayment\Service\OrderApprovalApplier;
+use Shubo\TbcPayment\Service\PaymentLock;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -42,9 +45,10 @@ class CheckStatusTest extends TestCase
     private OrderRepositoryInterface&MockObject $orderRepository;
     private StatusClient&MockObject $statusClient;
     private CallbackValidator&MockObject $callbackValidator;
-    private Config&MockObject $config;
+    private OrderApprovalApplier&MockObject $approvalApplier;
     private SettlementService&MockObject $settlementService;
     private LoggerInterface&MockObject $logger;
+    private PaymentLock&MockObject $paymentLock;
     private Context&MockObject $context;
     private HttpRequest&MockObject $request;
     private RedirectFactory&MockObject $redirectFactory;
@@ -66,9 +70,15 @@ class CheckStatusTest extends TestCase
         $this->orderRepository = $this->createMock(OrderRepositoryInterface::class);
         $this->statusClient = $this->createMock(StatusClient::class);
         $this->callbackValidator = $this->createMock(CallbackValidator::class);
-        $this->config = $this->createMock(Config::class);
+        $this->approvalApplier = $this->createMock(OrderApprovalApplier::class);
         $this->settlementService = $this->createMock(SettlementService::class);
         $this->logger = $this->createMock(LoggerInterface::class);
+        $this->paymentLock = $this->createMock(PaymentLock::class);
+
+        // Default: the lock is acquired and runs the wrapped callable.
+        $this->paymentLock->method('withLock')->willReturnCallback(
+            static fn (string $key, callable $cb): mixed => $cb()
+        );
 
         $this->request = $this->createMock(HttpRequest::class);
         $this->request->method('getParam')->willReturnCallback(
@@ -108,61 +118,34 @@ class CheckStatusTest extends TestCase
     }
 
     /**
-     * Architect-scope §3.1.4 / reviewer-signoff §S-2 — when Flitt reports
-     * "approved" and CheckStatus drives the processApproval branch in
-     * direct-sale mode, the dropped setParentTransactionId must never
-     * reappear.
+     * When Flitt reports "approved" and the order is still pending, CheckStatus
+     * delegates the shared approve mutation to OrderApprovalApplier with the
+     * ManualStatusCheck context. The preauth-vs-direct capture decision (and the
+     * dropped setParentTransactionId regression) now lives in — and is canary
+     * tested by — OrderApprovalApplierTest, not here.
      */
-    public function testProcessApprovalDirectSaleNeverCallsSetParentTransactionId(): void
+    public function testApprovedStatusDelegatesToApplierWithManualStatusCheckContext(): void
     {
-        [$order, $payment] = $this->makeApprovableOrder();
+        [$order] = $this->makeApprovableOrder();
         $this->orderRepository->method('get')->with(42)->willReturn($order);
 
+        // StatusClient::checkStatus returns the already-unwrapped `response` payload.
         $this->statusClient->method('checkStatus')->willReturn([
-            'response' => [
-                'order_status' => 'approved',
-                'payment_id'   => 'pay-77',
-                'amount'       => 5000,
-                'masked_card'  => '444455XXXXXX5555',
-            ],
+            'order_status' => 'approved',
+            'payment_id'   => 'pay-77',
+            'amount'       => 5000,
+            'masked_card'  => '444455XXXXXX5555',
         ]);
         $this->callbackValidator->method('validate')->willReturn(true);
-        $this->config->method('isPreauth')->willReturn(false);
 
-        $payment->expects(self::never())->method('setParentTransactionId');
+        $this->approvalApplier->expects(self::once())
+            ->method('apply')
+            ->with($order, self::isType('array'), ApprovalContext::ManualStatusCheck)
+            ->willReturn(ApprovalResult::Captured);
 
         $this->buildController()->execute();
 
-        // Sanity: success messaging fired (we actually walked the approval
-        // branch, the assertion is meaningful).
-        self::assertNotEmpty($this->successMessages);
-    }
-
-    /**
-     * Same regression but with isPreauth=true — the preauth branch in
-     * processApproval also previously stored a phantom parent_txn_id and
-     * must never reintroduce the setter.
-     */
-    public function testProcessApprovalPreauthNeverCallsSetParentTransactionId(): void
-    {
-        [$order, $payment] = $this->makeApprovableOrder();
-        $this->orderRepository->method('get')->with(42)->willReturn($order);
-
-        $this->statusClient->method('checkStatus')->willReturn([
-            'response' => [
-                'order_status' => 'approved',
-                'payment_id'   => 'pay-78',
-                'amount'       => 5000,
-                'masked_card'  => '444455XXXXXX5555',
-            ],
-        ]);
-        $this->callbackValidator->method('validate')->willReturn(true);
-        $this->config->method('isPreauth')->willReturn(true);
-
-        $payment->expects(self::never())->method('setParentTransactionId');
-
-        $this->buildController()->execute();
-
+        // Sanity: success messaging fired (we actually walked the approval branch).
         self::assertNotEmpty($this->successMessages);
     }
 
@@ -217,6 +200,56 @@ class CheckStatusTest extends TestCase
         }
     }
 
+    /**
+     * Finding #3 — serialized callback-then-CheckStatus (or two clicks). The
+     * pre-lock snapshot is PENDING_PAYMENT (so the approval branch is entered),
+     * but inside the lock the order is RELOADED and now reports PROCESSING (a
+     * concurrent capture path won). apply() must NOT be re-entered and no second
+     * registerCaptureNotification fires.
+     */
+    public function testInLockReloadSeesProcessingAndDoesNotReEnterApply(): void
+    {
+        // Pre-lock order: still pending → execute() enters the approval branch.
+        [$preLockOrder] = $this->makeApprovableOrder();
+
+        // In-lock reloaded order: already PROCESSING — applyApproval short-circuits.
+        $reloadedPayment = $this->createMock(Payment::class);
+        $reloadedPayment->method('getMethod')->willReturn(ConfigProvider::CODE);
+        $reloadedPayment->method('getAdditionalInformation')->willReturnCallback(
+            static fn (string $k): mixed => $k === 'flitt_order_id' ? 'duka_000000042_1700' : null
+        );
+        $reloadedPayment->expects(self::never())->method('registerCaptureNotification');
+
+        $reloadedOrder = $this->getMockBuilder(Order::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['getPayment', 'getState', 'getStoreId', 'getIncrementId'])
+            ->getMock();
+        $reloadedOrder->method('getPayment')->willReturn($reloadedPayment);
+        $reloadedOrder->method('getState')->willReturn(Order::STATE_PROCESSING);
+        $reloadedOrder->method('getStoreId')->willReturn(1);
+        $reloadedOrder->method('getIncrementId')->willReturn('000000042');
+
+        // get() sequence: pre-lock (execute) then in-lock reload (applyApproval).
+        $this->orderRepository->method('get')->with(42)->willReturnOnConsecutiveCalls(
+            $preLockOrder,
+            $reloadedOrder,
+        );
+
+        $this->statusClient->method('checkStatus')->willReturn([
+            'order_status' => 'approved',
+            'payment_id'   => 'pay-77',
+            'amount'       => 5000,
+        ]);
+        $this->callbackValidator->method('validate')->willReturn(true);
+
+        // The applier must NOT run — the reloaded order is already PROCESSING.
+        $this->approvalApplier->expects(self::never())->method('apply');
+        // No settlement on an already-processed reload.
+        $this->settlementService->expects(self::never())->method('settle');
+
+        $this->buildController()->execute();
+    }
+
     private function buildController(): CheckStatus
     {
         return new CheckStatus(
@@ -224,9 +257,10 @@ class CheckStatusTest extends TestCase
             $this->orderRepository,
             $this->statusClient,
             $this->callbackValidator,
-            $this->config,
+            $this->approvalApplier,
             $this->settlementService,
             $this->logger,
+            $this->paymentLock,
         );
     }
 

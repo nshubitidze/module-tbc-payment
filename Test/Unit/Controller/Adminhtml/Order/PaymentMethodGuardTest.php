@@ -19,12 +19,14 @@ use Shubo\TbcPayment\Controller\Adminhtml\Order\Capture;
 use Shubo\TbcPayment\Controller\Adminhtml\Order\CheckStatus;
 use Shubo\TbcPayment\Controller\Adminhtml\Order\Settle;
 use Shubo\TbcPayment\Controller\Adminhtml\Order\VoidPayment;
-use Shubo\TbcPayment\Gateway\Config\Config;
+use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
 use Shubo\TbcPayment\Gateway\Http\Client\CaptureClient;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
 use Shubo\TbcPayment\Gateway\Http\Client\VoidClient;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
 use Shubo\TbcPayment\Model\Ui\ConfigProvider;
+use Shubo\TbcPayment\Service\OrderApprovalApplier;
+use Shubo\TbcPayment\Service\PaymentLock;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -90,7 +92,8 @@ class PaymentMethodGuardTest extends TestCase
             $this->context,
             $this->orderRepository,
             $captureClient,
-            $this->createMock(Config::class),
+            $this->createMock(PaymentLock::class),
+            $this->createMock(UserFacingErrorMapper::class),
             $this->logger,
         );
 
@@ -113,7 +116,8 @@ class PaymentMethodGuardTest extends TestCase
             $this->context,
             $this->orderRepository,
             $captureClient,
-            $this->createMock(Config::class),
+            $this->createMock(PaymentLock::class),
+            $this->createMock(UserFacingErrorMapper::class),
             $this->logger,
         );
 
@@ -138,7 +142,6 @@ class PaymentMethodGuardTest extends TestCase
             $this->orderRepository,
             $this->logger,
             $voidClient,
-            $this->createMock(Config::class),
         );
 
         $controller->execute();
@@ -161,6 +164,7 @@ class PaymentMethodGuardTest extends TestCase
             $this->orderRepository,
             $settlementService,
             $this->logger,
+            $this->createMock(PaymentLock::class),
         );
 
         $controller->execute();
@@ -183,9 +187,10 @@ class PaymentMethodGuardTest extends TestCase
             $this->orderRepository,
             $statusClient,
             $this->createMock(CallbackValidator::class),
-            $this->createMock(Config::class),
+            $this->createMock(OrderApprovalApplier::class),
             $this->createMock(SettlementService::class),
             $this->logger,
+            $this->createMock(PaymentLock::class),
         );
 
         $controller->execute();
@@ -209,7 +214,8 @@ class PaymentMethodGuardTest extends TestCase
             $this->context,
             $this->orderRepository,
             $captureClient,
-            $this->createMock(Config::class),
+            $this->createMock(PaymentLock::class),
+            $this->createMock(UserFacingErrorMapper::class),
             $this->logger,
         );
 

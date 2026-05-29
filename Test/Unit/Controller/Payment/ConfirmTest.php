@@ -5,14 +5,11 @@ declare(strict_types=1);
 namespace Shubo\TbcPayment\Test\Unit\Controller\Payment;
 
 use Magento\Checkout\Model\Session as CheckoutSession;
-use Magento\Framework\Api\SearchCriteria;
-use Magento\Framework\Api\SearchCriteriaBuilder;
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\Controller\Result\Json as JsonResult;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\DB\Adapter\AdapterInterface;
 use Magento\Framework\DB\Select;
-use Magento\Sales\Api\Data\OrderSearchResultInterface;
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
@@ -20,9 +17,13 @@ use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Controller\Payment\Confirm;
-use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
+use Shubo\TbcPayment\Model\OrderLocator;
+use Shubo\TbcPayment\Service\ApprovalContext;
+use Shubo\TbcPayment\Service\ApprovalResult;
+use Shubo\TbcPayment\Service\OrderApprovalApplier;
+use Shubo\TbcPayment\Service\PaymentLock;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -36,11 +37,12 @@ class ConfirmTest extends TestCase
     private OrderRepositoryInterface&MockObject $orderRepository;
     private StatusClient&MockObject $statusClient;
     private CallbackValidator&MockObject $callbackValidator;
-    private Config&MockObject $config;
+    private OrderApprovalApplier&MockObject $approvalApplier;
     private SettlementService&MockObject $settlementService;
     private LoggerInterface&MockObject $logger;
     private ResourceConnection&MockObject $resourceConnection;
-    private SearchCriteriaBuilder&MockObject $searchCriteriaBuilder;
+    private OrderLocator&MockObject $orderLocator;
+    private PaymentLock&MockObject $paymentLock;
     private AdapterInterface&MockObject $connection;
     private JsonResult&MockObject $jsonResult;
 
@@ -54,11 +56,12 @@ class ConfirmTest extends TestCase
         $this->orderRepository = $this->createMock(OrderRepositoryInterface::class);
         $this->statusClient = $this->createMock(StatusClient::class);
         $this->callbackValidator = $this->createMock(CallbackValidator::class);
-        $this->config = $this->createMock(Config::class);
+        $this->approvalApplier = $this->createMock(OrderApprovalApplier::class);
         $this->settlementService = $this->createMock(SettlementService::class);
         $this->logger = $this->createMock(LoggerInterface::class);
         $this->resourceConnection = $this->createMock(ResourceConnection::class);
-        $this->searchCriteriaBuilder = $this->createMock(SearchCriteriaBuilder::class);
+        $this->orderLocator = $this->createMock(OrderLocator::class);
+        $this->paymentLock = $this->createMock(PaymentLock::class);
         $this->connection = $this->createMock(AdapterInterface::class);
         $this->jsonResult = $this->createMock(JsonResult::class);
 
@@ -71,6 +74,12 @@ class ConfirmTest extends TestCase
         $this->resourceConnection->method('getConnection')->willReturn($this->connection);
         $this->resourceConnection->method('getTableName')
             ->willReturnCallback(static fn (string $name): string => $name);
+
+        // Default: the lock is acquired and runs the wrapped callable. Tests that
+        // exercise contention override this with a willReturn(null).
+        $this->paymentLock->method('withLock')->willReturnCallback(
+            static fn (string $key, callable $cb): mixed => $cb()
+        );
     }
 
     public function testEarlyReturnWhenOrderAlreadyInProcessingState(): void
@@ -100,12 +109,13 @@ class ConfirmTest extends TestCase
         );
         $this->checkoutSession->method('getLastRealOrder')->willReturn($sessionOrder);
 
-        $this->statusClient->method('checkStatus')->willReturn(['response' => [
+        // StatusClient::checkStatus returns the already-unwrapped `response` payload.
+        $this->statusClient->method('checkStatus')->willReturn([
             'order_status' => 'approved',
             'order_id' => 'duka_000000042_1700',
             'payment_id' => 'pay-1',
             'amount' => 1000,
-        ]]);
+        ]);
         $this->callbackValidator->method('validate')->willReturn(true);
 
         // The reloaded order is already in PROCESSING — concurrent path won.
@@ -125,6 +135,9 @@ class ConfirmTest extends TestCase
         // path already finalised the order (otherwise duplicate invoice).
         $this->orderRepository->expects(self::never())->method('save');
 
+        // The applier must NOT run when the locked re-check sees PROCESSING.
+        $this->approvalApplier->expects(self::never())->method('apply');
+
         // Settlement must not run either (we returned null from processWithLock).
         $this->settlementService->expects(self::never())->method('settle');
 
@@ -133,7 +146,7 @@ class ConfirmTest extends TestCase
         self::assertTrue($this->lastResultData['success']);
     }
 
-    public function testHappyPathProcessesAndCommits(): void
+    public function testHappyPathInvokesApplierAndCommits(): void
     {
         $sessionOrder = $this->makeOrderMock(
             state: Order::STATE_PENDING_PAYMENT,
@@ -141,14 +154,13 @@ class ConfirmTest extends TestCase
         );
         $this->checkoutSession->method('getLastRealOrder')->willReturn($sessionOrder);
 
-        $this->statusClient->method('checkStatus')->willReturn(['response' => [
+        $this->statusClient->method('checkStatus')->willReturn([
             'order_status' => 'approved',
             'order_id' => 'duka_000000042_1700',
             'payment_id' => 'pay-1',
             'amount' => 1000,
-        ]]);
+        ]);
         $this->callbackValidator->method('validate')->willReturn(true);
-        $this->config->method('isPreauth')->willReturn(false);
 
         // The reloaded order is fresh: still pending — we should process.
         $reloadedOrder = $this->makeOrderMock(
@@ -156,15 +168,21 @@ class ConfirmTest extends TestCase
             flittOrderId: 'duka_000000042_1700',
             grandTotal: 10.00,
         );
-        $reloadedOrder->getPayment()
-            ->expects(self::never())
-            ->method('setParentTransactionId');
         $this->primeOrderRepositoryReload($reloadedOrder);
 
         $this->primeRowLockSelect();
 
         $this->connection->expects(self::once())->method('beginTransaction');
         $this->connection->expects(self::once())->method('commit');
+
+        // The shared approve mutation is delegated to the applier with the
+        // Confirm context — the preauth-vs-direct capture decision lives there
+        // (and is canary-tested in OrderApprovalApplierTest), not here.
+        $this->approvalApplier->expects(self::once())
+            ->method('apply')
+            ->with($reloadedOrder, self::isType('array'), ApprovalContext::Confirm)
+            ->willReturn(ApprovalResult::Captured);
+
         // Two saves: one inside transaction (order processed), one after settlement.
         $this->orderRepository->expects(self::atLeastOnce())->method('save');
 
@@ -174,12 +192,10 @@ class ConfirmTest extends TestCase
     }
 
     /**
-     * Regression for Session 3 Priority 3.1 — dropping the dangling
-     * parent_transaction_id synthesized from "{increment_id}-auth".
-     *
-     * Assert that the preauth branch also never calls setParentTransactionId.
+     * IMPROVE-2: lock contention (withLock → null) → no settlement, success
+     * reported (the concurrent holder finalises the order).
      */
-    public function testPreauthBranchDoesNotSetParentTransactionId(): void
+    public function testLockContentionReportsSuccessWithoutSettling(): void
     {
         $sessionOrder = $this->makeOrderMock(
             state: Order::STATE_PENDING_PAYMENT,
@@ -187,29 +203,116 @@ class ConfirmTest extends TestCase
         );
         $this->checkoutSession->method('getLastRealOrder')->willReturn($sessionOrder);
 
-        $this->statusClient->method('checkStatus')->willReturn(['response' => [
+        $this->statusClient->method('checkStatus')->willReturn([
             'order_status' => 'approved',
             'order_id' => 'duka_000000042_1700',
             'payment_id' => 'pay-1',
             'amount' => 1000,
-        ]]);
+        ]);
         $this->callbackValidator->method('validate')->willReturn(true);
-        $this->config->method('isPreauth')->willReturn(true);
+
+        // Contended lock: callable never runs → null.
+        $contendedLock = $this->createMock(PaymentLock::class);
+        $contendedLock->method('withLock')->willReturn(null);
+        $this->paymentLock = $contendedLock;
+
+        $this->approvalApplier->expects(self::never())->method('apply');
+        $this->settlementService->expects(self::never())->method('settle');
+
+        $this->buildController()->execute();
+
+        self::assertTrue($this->lastResultData['success']);
+    }
+
+    /**
+     * IMPROVE-8: a refused capture (amount mismatch) rolls back, leaves the
+     * order for admin reconcile (no settlement), and still reports success=true
+     * (the customer's embed confirm completed; the divergence is an internal
+     * reconcile concern logged at critical by the applier).
+     */
+    public function testAmountMismatchRollsBackAndDoesNotSettle(): void
+    {
+        $sessionOrder = $this->makeOrderMock(
+            state: Order::STATE_PENDING_PAYMENT,
+            flittOrderId: 'duka_000000042_1700',
+        );
+        $this->checkoutSession->method('getLastRealOrder')->willReturn($sessionOrder);
+
+        $this->statusClient->method('checkStatus')->willReturn([
+            'order_status' => 'approved',
+            'order_id' => 'duka_000000042_1700',
+            'payment_id' => 'pay-1',
+            'amount' => 9999,
+        ]);
+        $this->callbackValidator->method('validate')->willReturn(true);
+
+        $reloadedOrder = $this->makeOrderMock(
+            state: Order::STATE_PENDING_PAYMENT,
+            flittOrderId: 'duka_000000042_1700',
+        );
+        $this->primeOrderRepositoryReload($reloadedOrder);
+        $this->primeRowLockSelect();
+
+        $this->approvalApplier->expects(self::once())
+            ->method('apply')
+            ->willReturn(ApprovalResult::RefusedAmountMismatch);
+
+        $this->connection->expects(self::once())->method('beginTransaction');
+        $this->connection->expects(self::once())->method('rollBack');
+        $this->connection->expects(self::never())->method('commit');
+
+        // Refused → nothing persisted, nothing settled.
+        $this->orderRepository->expects(self::never())->method('save');
+        $this->settlementService->expects(self::never())->method('settle');
+
+        $this->buildController()->execute();
+
+        self::assertTrue($this->lastResultData['success']);
+    }
+
+    /**
+     * Finding #4 — a preauth-HELD result must NOT settle. The funds are only
+     * held, not captured; settling now would distribute the full amount to
+     * sub-merchant receivers before capture. The order is still committed/saved
+     * (the hold is persisted) and success is reported, but settle() never runs.
+     */
+    public function testPreauthHeldDoesNotSettle(): void
+    {
+        $sessionOrder = $this->makeOrderMock(
+            state: Order::STATE_PENDING_PAYMENT,
+            flittOrderId: 'duka_000000042_1700',
+        );
+        $this->checkoutSession->method('getLastRealOrder')->willReturn($sessionOrder);
+
+        $this->statusClient->method('checkStatus')->willReturn([
+            'order_status' => 'approved',
+            'order_id' => 'duka_000000042_1700',
+            'payment_id' => 'pay-1',
+            'amount' => 1000,
+        ]);
+        $this->callbackValidator->method('validate')->willReturn(true);
 
         $reloadedOrder = $this->makeOrderMock(
             state: Order::STATE_PENDING_PAYMENT,
             flittOrderId: 'duka_000000042_1700',
             grandTotal: 10.00,
         );
-        $reloadedOrder->getPayment()
-            ->expects(self::never())
-            ->method('setParentTransactionId');
         $this->primeOrderRepositoryReload($reloadedOrder);
-
         $this->primeRowLockSelect();
+
+        // Preauth held → committed + saved, but no capture.
+        $this->approvalApplier->expects(self::once())
+            ->method('apply')
+            ->with($reloadedOrder, self::isType('array'), ApprovalContext::Confirm)
+            ->willReturn(ApprovalResult::PreauthHeld);
 
         $this->connection->expects(self::once())->method('beginTransaction');
         $this->connection->expects(self::once())->method('commit');
+        $this->connection->expects(self::never())->method('rollBack');
+
+        // The order IS persisted (the hold), but settlement must NOT run.
+        $this->orderRepository->expects(self::atLeastOnce())->method('save');
+        $this->settlementService->expects(self::never())->method('settle');
 
         $this->buildController()->execute();
 
@@ -224,11 +327,12 @@ class ConfirmTest extends TestCase
             orderRepository: $this->orderRepository,
             statusClient: $this->statusClient,
             callbackValidator: $this->callbackValidator,
-            config: $this->config,
+            approvalApplier: $this->approvalApplier,
             settlementService: $this->settlementService,
             logger: $this->logger,
             resourceConnection: $this->resourceConnection,
-            searchCriteriaBuilder: $this->searchCriteriaBuilder,
+            orderLocator: $this->orderLocator,
+            paymentLock: $this->paymentLock,
         );
     }
 
@@ -274,14 +378,9 @@ class ConfirmTest extends TestCase
 
     private function primeOrderRepositoryReload(Order $order): void
     {
-        $searchCriteria = $this->createMock(SearchCriteria::class);
-        $this->searchCriteriaBuilder->method('addFilter')->willReturnSelf();
-        $this->searchCriteriaBuilder->method('setPageSize')->willReturnSelf();
-        $this->searchCriteriaBuilder->method('create')->willReturn($searchCriteria);
-
-        $searchResult = $this->createMock(OrderSearchResultInterface::class);
-        $searchResult->method('getItems')->willReturn([$order]);
-        $this->orderRepository->method('getList')->willReturn($searchResult);
+        // processWithLock reloads the order via OrderLocator::byIncrementId now
+        // (was the inline SearchCriteriaBuilder getList lookup).
+        $this->orderLocator->method('byIncrementId')->willReturn($order);
     }
 
     private function primeRowLockSelect(): void

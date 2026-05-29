@@ -9,9 +9,6 @@ use Magento\Framework\App\Action\HttpPostActionInterface;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\Controller\ResultInterface;
 use Magento\Framework\Exception\LocalizedException;
-use Magento\Framework\HTTP\Client\CurlFactory;
-use Magento\Framework\Locale\ResolverInterface;
-use Magento\Framework\Serialize\Serializer\Json;
 use Magento\Framework\UrlInterface;
 use Magento\Sales\Api\OrderPaymentRepositoryInterface;
 use Magento\Sales\Api\OrderRepositoryInterface;
@@ -20,6 +17,9 @@ use Magento\Sales\Model\Order\Payment;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Error\UserFacingErrorMapper;
+use Shubo\TbcPayment\Gateway\Exception\FlittApiException;
+use Shubo\TbcPayment\Gateway\Http\Client\FlittHttpClient;
+use Shubo\TbcPayment\Service\FlittLanguageResolver;
 
 /**
  * Creates a Flitt payment order for redirect checkout mode.
@@ -39,9 +39,8 @@ class Redirect implements HttpPostActionInterface
         private readonly Config $config,
         private readonly UrlInterface $urlBuilder,
         private readonly LoggerInterface $logger,
-        private readonly CurlFactory $curlFactory,
-        private readonly Json $json,
-        private readonly ResolverInterface $localeResolver,
+        private readonly FlittHttpClient $httpClient,
+        private readonly FlittLanguageResolver $languageResolver,
         private readonly OrderPaymentRepositoryInterface $paymentRepository,
         private readonly UserFacingErrorMapper $userFacingErrorMapper,
         private readonly OrderRepositoryInterface $orderRepository,
@@ -120,7 +119,7 @@ class Redirect implements HttpPostActionInterface
                 'amount'              => $amount,
                 'currency'            => $currency,
                 'sender_email'        => $senderEmail,
-                'lang'                => $this->resolveLanguage(),
+                'lang'                => $this->languageResolver->resolve(),
                 'response_url'        => $this->urlBuilder->getUrl(
                     'shubo_tbc/payment/returnAction',
                     ['_nosid' => true],
@@ -140,7 +139,7 @@ class Redirect implements HttpPostActionInterface
 
             $params['signature'] = Config::generateSignature($params, $password);
 
-            $checkoutUrl = $this->requestCheckoutUrl($apiUrl, $params, $storeId);
+            $checkoutUrl = $this->requestCheckoutUrl($params, $storeId);
 
             // Store flitt_order_id on the order payment so the callback and return
             // controllers can correlate Flitt responses back to this Magento order.
@@ -172,6 +171,23 @@ class Redirect implements HttpPostActionInterface
                 'success'      => true,
                 'checkout_url' => $checkoutUrl,
             ]);
+        } catch (FlittApiException $e) {
+            // Edge-cases-matrix §4: a Flitt transport failure or non-2xx response
+            // (curl timeout / network failure / API error) leaves the Magento
+            // order in pending_payment with a flitt_order_id Flitt has never seen.
+            // FlittHttpClient now wraps these as FlittApiException; record a visible
+            // breadcrumb on the order so admin / support can correlate the stuck
+            // order to the outage; the reconciler cancels it after payment_lifetime.
+            $this->logger->error('TBC Redirect error: ' . $e->getMessage(), [
+                'exception' => $e,
+            ]);
+
+            $this->recordFailureBreadcrumb($orderForFailureLog);
+
+            return $result->setData([
+                'success' => false,
+                'message' => (string) __('Unable to initialize payment. Please try again.'),
+            ]);
         } catch (LocalizedException $e) {
             $this->logger->error('TBC Redirect error: ' . $e->getMessage());
 
@@ -184,33 +200,43 @@ class Redirect implements HttpPostActionInterface
                 'exception' => $e,
             ]);
 
-            // Edge-cases-matrix §4: curl timeout / network failure leaves the
-            // Magento order in pending_payment with a flitt_order_id Flitt has
-            // never seen. Record a visible breadcrumb on the order so admin /
-            // support can correlate the stuck order to the outage; the
-            // reconciler will ultimately cancel it after payment_lifetime.
-            if ($orderForFailureLog !== null) {
-                try {
-                    $orderForFailureLog->addCommentToStatusHistory(
-                        (string) __(
-                            'Flitt token endpoint unreachable; reconciler will retry. '
-                            . 'Admin: investigate Flitt or cancel manually if persistent.'
-                        )
-                    );
-                    $this->orderRepository->save($orderForFailureLog);
-                } catch (\Exception $historyException) {
-                    $this->logger->error(
-                        'TBC Redirect: failed to persist failure history comment: '
-                        . $historyException->getMessage(),
-                        ['exception' => $historyException]
-                    );
-                }
-            }
+            // Any non-Flitt runtime failure after the order reference was taken —
+            // record the same breadcrumb so a stuck order is still traceable.
+            $this->recordFailureBreadcrumb($orderForFailureLog);
 
             return $result->setData([
                 'success' => false,
                 'message' => (string) __('Unable to initialize payment. Please try again.'),
             ]);
+        }
+    }
+
+    /**
+     * Attach a visible failure breadcrumb to a stuck pending-payment order.
+     *
+     * Best-effort: a failure to persist the comment must not mask the original
+     * payment error, so it is logged and swallowed (edge-cases-matrix §4).
+     */
+    private function recordFailureBreadcrumb(?Order $order): void
+    {
+        if ($order === null) {
+            return;
+        }
+
+        try {
+            $order->addCommentToStatusHistory(
+                (string) __(
+                    'Flitt token endpoint unreachable; reconciler will retry. '
+                    . 'Admin: investigate Flitt or cancel manually if persistent.'
+                )
+            );
+            $this->orderRepository->save($order);
+        } catch (\Exception $historyException) {
+            $this->logger->error(
+                'TBC Redirect: failed to persist failure history comment: '
+                . $historyException->getMessage(),
+                ['exception' => $historyException]
+            );
         }
     }
 
@@ -269,47 +295,29 @@ class Redirect implements HttpPostActionInterface
      *   /api/checkout/url    -> returns `checkout_url` + `payment_id` (for redirect)
      * We use the URL endpoint here.
      *
+     * Transport (curl/timeouts/connect-timeout/non-2xx handling) is delegated to
+     * {@see FlittHttpClient}; this method retains only the Flitt response-status
+     * inspection and friendly-error mapping. URL minting is non-idempotent, so
+     * the call is NOT retried.
+     *
      * @param array<string, mixed> $params Signed payment parameters
      * @throws LocalizedException When the API call fails or returns an error
      */
-    private function requestCheckoutUrl(string $apiUrl, array $params, int $storeId): string
+    private function requestCheckoutUrl(array $params, int $storeId): string
     {
-        $tokenUrl = $apiUrl . '/api/checkout/url';
-        $requestBody = $this->json->serialize(['request' => $params]);
-
-        $curl = $this->curlFactory->create();
-        $curl->addHeader('Content-Type', 'application/json');
-        // Bound the API call so a hung Flitt token endpoint cannot exhaust PHP workers.
-        $curl->setTimeout(30);
-        $curl->setOptions([
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_CONNECTTIMEOUT => 10,
-        ]);
-        $curl->post($tokenUrl, (string) $requestBody);
-
-        $responseBody = $curl->getBody();
-        $httpStatus = $curl->getStatus();
-
         if ($this->config->isDebugEnabled($storeId)) {
             $this->logger->debug('TBC redirect API request', [
-                'url'    => $tokenUrl,
-                'params' => array_diff_key($params, ['signature' => true]),
-            ]);
-            $this->logger->debug('TBC redirect API response', [
-                'http_status' => $httpStatus,
-                'body'        => $responseBody,
+                'endpoint' => '/api/checkout/url',
+                'params'   => array_diff_key($params, ['signature' => true]),
             ]);
         }
 
-        if ($httpStatus < 200 || $httpStatus >= 300) {
-            throw new LocalizedException(
-                __('Flitt API returned HTTP %1.', $httpStatus),
-            );
-        }
+        // FlittApiException extends LocalizedException; a non-2xx HTTP status
+        // therefore surfaces through the controller's catch (LocalizedException)
+        // block exactly as the previous inline implementation did.
+        $responseData = $this->httpClient->post('/api/checkout/url', ['request' => $params], $storeId);
 
         /** @var array{response?: array{response_status?: string, checkout_url?: string, error_message?: string}} $responseData */
-        $responseData = $this->json->unserialize($responseBody);
-
         $response = $responseData['response'] ?? [];
         $status = $response['response_status'] ?? '';
         $checkoutUrl = $response['checkout_url'] ?? '';
@@ -341,17 +349,5 @@ class Redirect implements HttpPostActionInterface
         }
 
         return $checkoutUrl;
-    }
-
-    private function resolveLanguage(): string
-    {
-        $locale = $this->localeResolver->getLocale();
-        $language = substr($locale, 0, 2);
-
-        return match ($language) {
-            'ka'    => 'ka',
-            'ru'    => 'ru',
-            default => 'en',
-        };
     }
 }

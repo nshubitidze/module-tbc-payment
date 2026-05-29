@@ -30,6 +30,13 @@
                 <enable_wallets>0</enable_wallets>
                 <payment_action_mode>authorize</payment_action_mode>
                 <payment_lifetime>3600</payment_lifetime>
+                <http_connect_timeout>5</http_connect_timeout>
+                <http_read_timeout>30</http_read_timeout>
+                <http_status_retries>1</http_status_retries>
+                <settlement_max_attempts>6</settlement_max_attempts>
+                <reconcile_max_attempts>12</reconcile_max_attempts>
+                <backlog_alert_threshold>50</backlog_alert_threshold>
+                <callback_ip_allowlist></callback_ip_allowlist>
                 <checkout_type>embed</checkout_type>
                 <brand_logo_url></brand_logo_url>
                 <brand_description></brand_description>

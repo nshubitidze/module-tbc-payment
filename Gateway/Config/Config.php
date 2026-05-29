@@ -36,6 +36,20 @@ class Config extends \Magento\Payment\Gateway\Config\Config
     private const KEY_BRAND_DESCRIPTION = 'brand_description';
     private const KEY_BRAND_ACCENT_COLOR = 'brand_accent_color';
     private const KEY_BRAND_STRIP_PROVIDER = 'brand_strip_provider';
+    private const KEY_HTTP_CONNECT_TIMEOUT = 'http_connect_timeout';
+    private const KEY_HTTP_READ_TIMEOUT = 'http_read_timeout';
+    private const KEY_HTTP_STATUS_RETRIES = 'http_status_retries';
+    private const KEY_CALLBACK_IP_ALLOWLIST = 'callback_ip_allowlist';
+    private const KEY_SETTLEMENT_MAX_ATTEMPTS = 'settlement_max_attempts';
+    private const KEY_RECONCILE_MAX_ATTEMPTS = 'reconcile_max_attempts';
+    private const KEY_BACKLOG_ALERT_THRESHOLD = 'backlog_alert_threshold';
+
+    private const DEFAULT_HTTP_CONNECT_TIMEOUT = 5;
+    private const DEFAULT_HTTP_READ_TIMEOUT = 30;
+    private const DEFAULT_HTTP_STATUS_RETRIES = 1;
+    private const DEFAULT_SETTLEMENT_MAX_ATTEMPTS = 6;
+    private const DEFAULT_RECONCILE_MAX_ATTEMPTS = 12;
+    private const DEFAULT_BACKLOG_ALERT_THRESHOLD = 50;
 
     public function __construct(
         ScopeConfigInterface $scopeConfig,
@@ -170,6 +184,135 @@ class Config extends \Magento\Payment\Gateway\Config\Config
     public function shouldStripProviderBranding(?int $storeId = null): bool
     {
         return (bool) $this->getValue(self::KEY_BRAND_STRIP_PROVIDER, $storeId);
+    }
+
+    /**
+     * Connection timeout (seconds) for Flitt HTTP calls.
+     *
+     * Bounds how long the TCP/TLS handshake may take before the call is
+     * abandoned, so a black-holed Flitt host cannot pin a PHP worker for the
+     * full read timeout. Clamped to a sane 1–60s window.
+     */
+    public function getHttpConnectTimeout(?int $storeId = null): int
+    {
+        $value = (int) ($this->getValue(self::KEY_HTTP_CONNECT_TIMEOUT, $storeId)
+            ?: self::DEFAULT_HTTP_CONNECT_TIMEOUT);
+
+        return min(max($value, 1), 60);
+    }
+
+    /**
+     * Read/total timeout (seconds) for Flitt HTTP calls.
+     *
+     * Bounds the full request once connected. Clamped to a 1–120s window.
+     */
+    public function getHttpReadTimeout(?int $storeId = null): int
+    {
+        $value = (int) ($this->getValue(self::KEY_HTTP_READ_TIMEOUT, $storeId)
+            ?: self::DEFAULT_HTTP_READ_TIMEOUT);
+
+        return min(max($value, 1), 120);
+    }
+
+    /**
+     * Number of additional attempts for idempotent (status-only) Flitt calls.
+     *
+     * Applies ONLY to retryable reads (status checks). Non-idempotent calls
+     * (capture/void/settle/refund/token) never retry regardless of this value.
+     * Clamped to 0–3.
+     */
+    public function getHttpStatusRetries(?int $storeId = null): int
+    {
+        $value = (int) ($this->getValue(self::KEY_HTTP_STATUS_RETRIES, $storeId)
+            ?? self::DEFAULT_HTTP_STATUS_RETRIES);
+
+        return min(max($value, 0), 3);
+    }
+
+    /**
+     * IMPROVE-9: Flitt callback source-IP allowlist.
+     *
+     * Returns the configured comma/whitespace-separated list of Flitt egress
+     * IPs that are permitted to POST to the server-to-server callback endpoint,
+     * parsed into a trimmed list of non-empty entries.
+     *
+     * FAIL-OPEN: when the admin leaves the field EMPTY this returns an empty
+     * list, and the Callback controller allows ALL source IPs. This is
+     * deliberate — environments behind a reverse proxy / load balancer that
+     * does not forward the real client IP must not be locked out. The allowlist
+     * is an optional defence-in-depth layer ON TOP of signature validation,
+     * never the primary gate.
+     *
+     * Default (config.xml): EMPTY — out-of-the-box fail-open. An admin opts in
+     * by pasting Flitt's egress IPs (the documented `54.154.216.60,3.75.125.89`
+     * are a suggested starting point, shown in the system.xml field comment).
+     *
+     * @return list<string>
+     */
+    public function getCallbackIpAllowlist(?int $storeId = null): array
+    {
+        $raw = (string) ($this->getValue(self::KEY_CALLBACK_IP_ALLOWLIST, $storeId) ?: '');
+        if ($raw === '') {
+            return [];
+        }
+
+        $parts = preg_split('/[\s,]+/', $raw) ?: [];
+
+        return array_values(array_filter(
+            array_map('trim', $parts),
+            static fn (string $ip): bool => $ip !== ''
+        ));
+    }
+
+    /**
+     * IMPROVE-4: maximum number of settlement attempts before the
+     * settlement-recovery cron stops re-driving and alerts ops.
+     *
+     * Each attempt against Flitt uses a distinct settlement order_id (the
+     * BUG-7 retry-suffix). The cap bounds the suffix counter so a permanently
+     * failing settlement (e.g. a receiver merchant_id that no longer exists)
+     * does not retry forever; when exceeded the recovery cron emits an
+     * ERROR (→ Sentry) for manual intervention. Clamped to a sane 1–20 window.
+     */
+    public function getSettlementMaxAttempts(?int $storeId = null): int
+    {
+        $value = (int) ($this->getValue(self::KEY_SETTLEMENT_MAX_ATTEMPTS, $storeId)
+            ?: self::DEFAULT_SETTLEMENT_MAX_ATTEMPTS);
+
+        return min(max($value, 1), 20);
+    }
+
+    /**
+     * IMPROVE-5: maximum number of reconcile attempts before the pending-order
+     * reconciler moves an order to a terminal "needs manual review" outcome.
+     *
+     * The counter is persisted on the payment so terminal orders drop out of
+     * the candidate set, allowing a >page-size backlog of oldest-unresolved
+     * orders to drain instead of starving newer ones. Clamped to a sane
+     * 1–50 window.
+     */
+    public function getReconcileMaxAttempts(?int $storeId = null): int
+    {
+        $value = (int) ($this->getValue(self::KEY_RECONCILE_MAX_ATTEMPTS, $storeId)
+            ?: self::DEFAULT_RECONCILE_MAX_ATTEMPTS);
+
+        return min(max($value, 1), 50);
+    }
+
+    /**
+     * IMPROVE-6: backlog size at or above which the reconciler / recovery cron
+     * emits an ERROR-level health alert (→ Sentry).
+     *
+     * The backlog health check counts stuck pending orders plus
+     * unsettled-approved orders; when the total reaches this threshold an
+     * ERROR is logged so ops are paged. Clamped to a sane 1–10000 window.
+     */
+    public function getBacklogAlertThreshold(?int $storeId = null): int
+    {
+        $value = (int) ($this->getValue(self::KEY_BACKLOG_ALERT_THRESHOLD, $storeId)
+            ?: self::DEFAULT_BACKLOG_ALERT_THRESHOLD);
+
+        return min(max($value, 1), 10000);
     }
 
     /**

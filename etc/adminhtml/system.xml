@@ -115,6 +115,70 @@
                     <validate>validate-digits validate-greater-than-zero</validate>
                 </field>
 
+                <field id="http_connect_timeout" translate="label comment" type="text" sortOrder="93"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>API Connect Timeout (seconds)</label>
+                    <comment>Max time to establish a connection to Flitt before giving up. Default: 5. Clamped 1-60.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+
+                <field id="http_read_timeout" translate="label comment" type="text" sortOrder="94"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>API Read Timeout (seconds)</label>
+                    <comment>Max time to wait for a full Flitt response once connected. Default: 30. Clamped 1-120.</comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+
+                <field id="http_status_retries" translate="label comment" type="text" sortOrder="94"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Status Check Retries</label>
+                    <comment><![CDATA[Extra attempts for <strong>idempotent status checks only</strong>
+                        (e.g. the reconciler) on transport failure. Capture, void, settlement and refund
+                        are NEVER retried. Default: 1. Clamped 0-3.]]></comment>
+                    <validate>validate-digits</validate>
+                </field>
+
+                <field id="settlement_max_attempts" translate="label comment" type="text" sortOrder="941"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Settlement Recovery Max Attempts</label>
+                    <comment><![CDATA[How many times the settlement-recovery cron re-drives a FAILED split
+                        settlement before it stops and alerts ops. Each attempt uses a distinct settlement
+                        order_id. Default: 6. Clamped 1-20.]]></comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                    <depends>
+                        <field id="split_payments_enabled">1</field>
+                    </depends>
+                </field>
+
+                <field id="reconcile_max_attempts" translate="label comment" type="text" sortOrder="942"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Pending Reconcile Max Attempts</label>
+                    <comment><![CDATA[How many reconcile passes the pending-order cron makes on a stuck order
+                        before moving it to a terminal "needs manual review" outcome (so the backlog can drain).
+                        An order older than 2x the Payment Lifetime is also made terminal. Default: 12. Clamped 1-50.]]></comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+
+                <field id="backlog_alert_threshold" translate="label comment" type="text" sortOrder="943"
+                       showInDefault="1" showInWebsite="1" showInStore="0">
+                    <label>Backlog Alert Threshold</label>
+                    <comment><![CDATA[Stuck-pending or unsettled-approved backlog size at or above which the
+                        reconciler crons emit an ERROR-level alert (forwarded to Sentry). Default: 50. Clamped 1-10000.]]></comment>
+                    <validate>validate-digits validate-greater-than-zero</validate>
+                </field>
+
+                <field id="callback_ip_allowlist" translate="label comment" type="textarea" sortOrder="94"
+                       showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Callback Source-IP Allowlist</label>
+                    <comment><![CDATA[Optional comma- or whitespace-separated list of Flitt egress IPs
+                        permitted to POST to the server-to-server callback endpoint. <strong>Default is EMPTY, which
+                        allows all source IPs</strong> (fail-open) — required if your stack sits behind a proxy/load
+                        balancer that does not forward the real client IP. This is an opt-in defence-in-depth layer on
+                        top of signature validation, not the primary gate. To enable it, paste the documented Flitt
+                        egress IPs as a starting point: <code>54.154.216.60,3.75.125.89</code> (verify against Flitt's
+                        current egress before relying on it).]]></comment>
+                </field>
+
                 <field id="embed_theme_type" translate="label comment" type="select" sortOrder="95"
                        showInDefault="1" showInWebsite="1" showInStore="1">
                     <label>Checkout Theme</label>

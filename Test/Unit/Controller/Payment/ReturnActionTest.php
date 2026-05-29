@@ -5,14 +5,11 @@ declare(strict_types=1);
 namespace Shubo\TbcPayment\Test\Unit\Controller\Payment;
 
 use Magento\Checkout\Model\Session as CheckoutSession;
-use Magento\Framework\Api\SearchCriteria;
-use Magento\Framework\Api\SearchCriteriaBuilder;
 use Magento\Framework\App\Request\Http as HttpRequest;
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\Controller\Result\Redirect as RedirectResult;
 use Magento\Framework\Controller\Result\RedirectFactory;
 use Magento\Framework\Message\ManagerInterface as MessageManagerInterface;
-use Magento\Sales\Api\Data\OrderSearchResultInterface;
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
 use Magento\Sales\Model\Order\Payment;
@@ -20,9 +17,12 @@ use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use Shubo\TbcPayment\Controller\Payment\ReturnAction;
-use Shubo\TbcPayment\Gateway\Config\Config;
 use Shubo\TbcPayment\Gateway\Http\Client\StatusClient;
 use Shubo\TbcPayment\Gateway\Validator\CallbackValidator;
+use Shubo\TbcPayment\Model\OrderLocator;
+use Shubo\TbcPayment\Service\ApprovalResult;
+use Shubo\TbcPayment\Service\OrderApprovalApplier;
+use Shubo\TbcPayment\Service\PaymentLock;
 use Shubo\TbcPayment\Service\SettlementService;
 
 /**
@@ -46,14 +46,15 @@ class ReturnActionTest extends TestCase
     private RedirectResult&MockObject $redirectResult;
     private CheckoutSession&MockObject $checkoutSession;
     private OrderRepositoryInterface&MockObject $orderRepository;
-    private SearchCriteriaBuilder&MockObject $searchCriteriaBuilder;
+    private OrderLocator&MockObject $orderLocator;
     private StatusClient&MockObject $statusClient;
     private CallbackValidator&MockObject $callbackValidator;
+    private OrderApprovalApplier&MockObject $approvalApplier;
     private SettlementService&MockObject $settlementService;
     private MessageManagerInterface&MockObject $messageManager;
-    private Config&MockObject $config;
     private LoggerInterface&MockObject $logger;
     private ResourceConnection&MockObject $resourceConnection;
+    private PaymentLock&MockObject $paymentLock;
 
     /** @var list<string> */
     private array $redirectTargets = [];
@@ -67,14 +68,20 @@ class ReturnActionTest extends TestCase
         $this->redirectResult       = $this->createMock(RedirectResult::class);
         $this->checkoutSession      = $this->createMock(CheckoutSession::class);
         $this->orderRepository      = $this->createMock(OrderRepositoryInterface::class);
-        $this->searchCriteriaBuilder = $this->createMock(SearchCriteriaBuilder::class);
+        $this->orderLocator         = $this->createMock(OrderLocator::class);
         $this->statusClient         = $this->createMock(StatusClient::class);
         $this->callbackValidator    = $this->createMock(CallbackValidator::class);
+        $this->approvalApplier      = $this->createMock(OrderApprovalApplier::class);
         $this->settlementService    = $this->createMock(SettlementService::class);
         $this->messageManager       = $this->createMock(MessageManagerInterface::class);
-        $this->config               = $this->createMock(Config::class);
         $this->logger               = $this->createMock(LoggerInterface::class);
         $this->resourceConnection   = $this->createMock(ResourceConnection::class);
+        $this->paymentLock          = $this->createMock(PaymentLock::class);
+
+        // Default: the lock is acquired and runs the wrapped callable.
+        $this->paymentLock->method('withLock')->willReturnCallback(
+            static fn (string $key, callable $cb): mixed => $cb()
+        );
 
         $this->redirectFactory->method('create')->willReturn($this->redirectResult);
         $this->redirectResult->method('setPath')->willReturnCallback(
@@ -194,6 +201,109 @@ class ReturnActionTest extends TestCase
     }
 
     /**
+     * IMPROVE-2: lock contention (withLock → null) → the customer is still sent
+     * to the success page (they paid; the concurrent holder finalises the
+     * order). A fresh order read stamps the session data.
+     */
+    public function testLockContentionStillRedirectsToSuccess(): void
+    {
+        [$order] = $this->primeFlittStatus('approved', cancelable: true);
+        $this->callbackValidator->method('validate')->willReturn(true);
+        $this->orderRepository->method('get')->willReturn($order);
+        $this->resourceConnection->method('getTableName')
+            ->willReturnCallback(static fn (string $name): string => $name);
+
+        // Contended lock: callable never runs → null.
+        $contendedLock = $this->createMock(PaymentLock::class);
+        $contendedLock->method('withLock')->willReturn(null);
+        $this->paymentLock = $contendedLock;
+
+        $this->approvalApplier->expects(self::never())->method('apply');
+
+        $this->buildController()->execute();
+
+        self::assertSame(['checkout/onepage/success'], $this->redirectTargets);
+    }
+
+    /**
+     * IMPROVE-8: a refused capture (amount mismatch) → the customer is sent to
+     * the failure page rather than confirming a wrong total; the order is left
+     * for admin reconcile.
+     */
+    public function testAmountMismatchRedirectsToFailure(): void
+    {
+        [$order] = $this->primeFlittStatus('approved', cancelable: true);
+        $this->callbackValidator->method('validate')->willReturn(true);
+        $this->orderRepository->method('get')->willReturn($order);
+
+        $connection = $this->createMock(\Magento\Framework\DB\Adapter\AdapterInterface::class);
+        $select = $this->createMock(\Magento\Framework\DB\Select::class);
+        $select->method('from')->willReturnSelf();
+        $select->method('where')->willReturnSelf();
+        $select->method('forUpdate')->willReturnSelf();
+        $connection->method('select')->willReturn($select);
+        $connection->method('fetchRow')->willReturn(['entity_id' => 42, 'state' => 'pending_payment']);
+        $this->resourceConnection->method('getConnection')->willReturn($connection);
+        $this->resourceConnection->method('getTableName')
+            ->willReturnCallback(static fn (string $name): string => $name);
+
+        $this->approvalApplier->expects(self::once())
+            ->method('apply')
+            ->willReturn(ApprovalResult::RefusedAmountMismatch);
+
+        // Refused capture rolls back; nothing saved, nothing settled.
+        $this->orderRepository->expects(self::never())->method('save');
+        $this->settlementService->expects(self::never())->method('settle');
+        $connection->expects(self::once())->method('rollBack');
+        $connection->expects(self::never())->method('commit');
+
+        $this->buildController()->execute();
+
+        self::assertSame(['checkout/onepage/failure'], $this->redirectTargets);
+    }
+
+    /**
+     * Finding #4 — a preauth-HELD result must NOT settle. The customer still
+     * reaches the success page (their payment was approved/held) and the order
+     * is committed/saved, but settle() never runs (settling on a held pre-auth
+     * would distribute the full amount to receivers before capture).
+     */
+    public function testPreauthHeldRedirectsToSuccessWithoutSettling(): void
+    {
+        [$order] = $this->primeFlittStatus('approved', cancelable: true);
+        $this->callbackValidator->method('validate')->willReturn(true);
+        $this->orderRepository->method('get')->willReturn($order);
+        // setCheckoutSessionData calls magic setters on the session; the mock
+        // handles them as no-ops. getQuoteId is read for the session stamp.
+        $order->method('getQuoteId')->willReturn(7);
+
+        $connection = $this->createMock(\Magento\Framework\DB\Adapter\AdapterInterface::class);
+        $select = $this->createMock(\Magento\Framework\DB\Select::class);
+        $select->method('from')->willReturnSelf();
+        $select->method('where')->willReturnSelf();
+        $select->method('forUpdate')->willReturnSelf();
+        $connection->method('select')->willReturn($select);
+        $connection->method('fetchRow')->willReturn(['entity_id' => 42, 'state' => 'pending_payment']);
+        $this->resourceConnection->method('getConnection')->willReturn($connection);
+        $this->resourceConnection->method('getTableName')
+            ->willReturnCallback(static fn (string $name): string => $name);
+
+        $this->approvalApplier->expects(self::once())
+            ->method('apply')
+            ->willReturn(ApprovalResult::PreauthHeld);
+
+        // Held → committed, order saved once (inside txn), but NO settlement.
+        $connection->expects(self::once())->method('commit');
+        $connection->expects(self::never())->method('rollBack');
+        $this->orderRepository->expects(self::once())->method('save');
+        $this->settlementService->expects(self::never())->method('settle');
+
+        $this->buildController()->execute();
+
+        self::assertSame(['checkout/onepage/success'], $this->redirectTargets);
+    }
+
+    /**
      * @return array{0: Order&MockObject, 1: Payment&MockObject}
      */
     private function primeFlittStatus(string $status, bool $cancelable = false): array
@@ -218,17 +328,13 @@ class ReturnActionTest extends TestCase
             $order->method('addCommentToStatusHistory')->willReturnSelf();
         }
 
-        $searchResult = $this->createMock(OrderSearchResultInterface::class);
-        $searchResult->method('getItems')->willReturn([$order]);
+        // The controller resolves the order via OrderLocator::byFlittOrderId now
+        // (was the inline regex + SearchCriteriaBuilder getList + stored-id check).
+        $this->orderLocator->method('byFlittOrderId')->willReturn($order);
 
-        $searchCriteria = $this->createMock(SearchCriteria::class);
-        $this->searchCriteriaBuilder->method('addFilter')->willReturnSelf();
-        $this->searchCriteriaBuilder->method('setPageSize')->willReturnSelf();
-        $this->searchCriteriaBuilder->method('create')->willReturn($searchCriteria);
-        $this->orderRepository->method('getList')->willReturn($searchResult);
-
+        // StatusClient::checkStatus returns the already-unwrapped `response` payload.
         $this->statusClient->method('checkStatus')
-            ->willReturn(['response' => ['order_status' => $status]]);
+            ->willReturn(['order_status' => $status]);
 
         return [$order, $payment];
     }
@@ -240,14 +346,15 @@ class ReturnActionTest extends TestCase
             $this->redirectFactory,
             $this->checkoutSession,
             $this->orderRepository,
-            $this->searchCriteriaBuilder,
+            $this->orderLocator,
             $this->statusClient,
             $this->callbackValidator,
+            $this->approvalApplier,
             $this->settlementService,
             $this->messageManager,
-            $this->config,
             $this->logger,
             $this->resourceConnection,
+            $this->paymentLock,
         );
     }
 }

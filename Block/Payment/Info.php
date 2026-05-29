@@ -34,20 +34,24 @@ class Info extends PaymentInfo
         $info = [];
         $payment = $this->getInfo();
 
+        // Label phrases are spelled out as literal __() arguments (rather than
+        // looping over a [label => key] map with __($label)) so the i18n
+        // phrase collector can extract them — a variable __() argument is
+        // invisible to `bin/magento i18n:collect-phrases`.
         $additionalData = [
-            'Payment ID' => 'payment_id',
-            'Order Status' => 'order_status',
-            'Masked Card' => 'masked_card',
-            'Card Type' => 'card_type',
-            'RRN' => 'rrn',
-            'Approval Code' => 'approval_code',
-            'Transaction Type' => 'tran_type',
+            'payment_id' => __('Payment ID'),
+            'order_status' => __('Order Status'),
+            'masked_card' => __('Masked Card'),
+            'card_type' => __('Card Type'),
+            'rrn' => __('RRN'),
+            'approval_code' => __('Approval Code'),
+            'tran_type' => __('Transaction Type'),
         ];
 
-        foreach ($additionalData as $label => $key) {
+        foreach ($additionalData as $key => $label) {
             $value = $payment->getAdditionalInformation($key);
             if (!empty($value)) {
-                $info[(string) __($label)] = (string) $value;
+                $info[(string) $label] = (string) $value;
             }
         }
 
@@ -116,7 +120,14 @@ class Info extends PaymentInfo
     public function getSettlementInfo(): ?array
     {
         $info = $this->getInfo();
+        // IMPROVE-4: settlement_status is set ONLY on genuine success; a failed
+        // (retryable) attempt records under settlement_last_status. Display the
+        // success status if present, otherwise surface the last failure so the
+        // admin sees that a retry is pending.
         $status = $info->getAdditionalInformation('settlement_status');
+        if (empty($status)) {
+            $status = $info->getAdditionalInformation('settlement_last_status');
+        }
 
         if (empty($status)) {
             return null;
@@ -147,7 +158,7 @@ class Info extends PaymentInfo
         }
 
         return [
-            'status' => $status,
+            'status' => (string) $status,
             'receivers' => $receivers,
         ];
     }
